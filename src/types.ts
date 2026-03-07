@@ -12,6 +12,7 @@ export interface Employee {
   medicalLeaveDates: string[]; // ISO dates
   position: Position;
   isRefuerzo: boolean;
+  monthlyCost: number;
 }
 
 export interface RestaurantConfig {

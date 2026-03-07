@@ -17,11 +17,14 @@ import {
   CheckCircle2,
   Info,
   ChefHat,
-  Activity
+  Activity,
+  Download
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { format, addDays, startOfWeek, endOfWeek, eachDayOfInterval, isSameDay, parseISO } from 'date-fns';
+import { format, addDays, startOfWeek, endOfWeek, eachDayOfInterval, isSameDay, parseISO, getMonth, getYear } from 'date-fns';
 import { es } from 'date-fns/locale';
+import jsPDF from 'jspdf';
+import autoTable from 'jspdf-autotable';
 import { 
   BarChart, 
   Bar, 
@@ -71,6 +74,7 @@ export default function App() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [aiAnalysis, setAiAnalysis] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'quadrant' | 'employees' | 'analytics' | 'settings'>('quadrant');
+  const [viewMode, setViewMode] = useState<'week' | 'fortnight' | 'month'>('fortnight');
 
   // --- Setup Wizard State ---
   const [setupStep, setSetupStep] = useState(1);
@@ -103,7 +107,7 @@ export default function App() {
       const ws = wb.Sheets[wsname];
       const data = XLSX.utils.sheet_to_json(ws, { header: 1 }) as any[][];
 
-      // Assuming columns: Nombre Apellidos, Jornada Semanal, Posición
+      // Assuming columns: Nombre Apellidos, Jornada Semanal, Posición, Refuerzo, Coste Mensual
       // Skip header row
       const newEmployees: Employee[] = data.slice(1).map((row, index) => {
         const fullName = String(row[0] || '');
@@ -114,6 +118,7 @@ export default function App() {
         const isRefuerzo = String(row[3] || '').toLowerCase().includes('sí') || String(row[3] || '').toLowerCase().includes('si') || Boolean(row[3]);
         const position: Position = posInput.includes('cocina') ? 'cocina' : 
                                   posInput.includes('sala') ? 'sala' : 'refuerzo';
+        const monthlyCost = Number(row[4]) || 0;
 
         return {
           id: `excel-${Date.now()}-${index}`,
@@ -125,7 +130,8 @@ export default function App() {
           vacationDates: [],
           medicalLeaveDates: [],
           position,
-          isRefuerzo
+          isRefuerzo,
+          monthlyCost
         };
       });
 
@@ -135,13 +141,24 @@ export default function App() {
   };
 
   // --- Dashboard Logic ---
-  const currentWeekStart = startOfWeek(new Date(), { weekStartsOn: 1 });
-  const weekDays = eachDayOfInterval({
-    start: currentWeekStart,
-    end: endOfWeek(currentWeekStart, { weekStartsOn: 1 })
-  });
+  const currentPeriodStart = startOfWeek(new Date(), { weekStartsOn: 1 });
+  
+  const periodDays = useMemo(() => {
+    let end;
+    if (viewMode === 'week') end = addDays(currentPeriodStart, 6);
+    else if (viewMode === 'fortnight') end = addDays(currentPeriodStart, 13);
+    else end = addDays(currentPeriodStart, 29); // Approx month
 
-  const generateQuadrant = () => {
+    return eachDayOfInterval({
+      start: currentPeriodStart,
+      end: end
+    });
+  }, [viewMode, currentPeriodStart]);
+
+  const generateQuadrant = (employeesOverride?: Employee[]) => {
+    const employeesToUse = employeesOverride || employees;
+    if (employeesToUse.length === 0) return;
+
     setIsGenerating(true);
     const newShifts: Shift[] = [];
     
@@ -153,8 +170,8 @@ export default function App() {
     const employeeRestDays = new Map<string, number[]>();
     
     // Determine which employees get Fri/Sat rest days (30%)
-    const numEmployeesWithWeekendRest = Math.max(1, Math.round(employees.length * 0.3));
-    const shuffledEmployees = [...employees].sort(() => Math.random() - 0.5);
+    const numEmployeesWithWeekendRest = Math.max(1, Math.round(employeesToUse.length * 0.3));
+    const shuffledEmployees = [...employeesToUse].sort(() => Math.random() - 0.5);
     
     shuffledEmployees.forEach((emp, index) => {
       let restDays: number[] = [];
@@ -193,61 +210,109 @@ export default function App() {
       employeeRestDays.set(emp.id, restDays);
     });
 
-    employees.forEach((emp, empIndex) => {
-      const restDays = employeeRestDays.get(emp.id) || [];
-      let lastShiftType: ShiftType | 'OFF' | null = null;
+    const lastShiftMap = new Map<string, ShiftType | 'OFF' | 'VAC' | 'BAJA' | null>();
+    const mCountMap = new Map<string, number>();
+    const tCountMap = new Map<string, number>();
+
+    periodDays.forEach((day, dayIndex) => {
+      const dayName = format(day, 'EEEE', { locale: es });
+      const dateStr = format(day, 'yyyy-MM-dd');
+      const dayOfWeek = (dayIndex % 7); // 0=Mon, 6=Sun
+
+      const availableEmployees: Employee[] = [];
       
-      weekDays.forEach((day, dayIndex) => {
-        const dayName = format(day, 'EEEE', { locale: es });
-        const dateStr = format(day, 'yyyy-MM-dd');
-        
-        // Skip closing day
-        if (config.closingDay && dayName.toLowerCase() === config.closingDay.toLowerCase()) {
-          newShifts.push({ employeeId: emp.id, date: dateStr, type: 'OFF' });
-          lastShiftType = 'OFF';
-          return;
-        }
+      employeesToUse.forEach(emp => {
+        const restDays = employeeRestDays.get(emp.id) || [];
+        let status: 'OFF' | 'VAC' | 'BAJA' | null = null;
 
-        // Check if it's a rest day
-        // dayIndex is 0-6 (Mon-Sun)
-        if (restDays.includes(dayIndex)) {
-          newShifts.push({ employeeId: emp.id, date: dateStr, type: 'OFF' });
-          lastShiftType = 'OFF';
-          return;
-        }
+        if (config.closingDay && dayName.toLowerCase() === config.closingDay.toLowerCase()) status = 'OFF';
+        else if (restDays.includes(dayOfWeek)) status = 'OFF';
+        else if (emp.vacationDates.includes(dateStr)) status = 'VAC';
+        else if (emp.medicalLeaveDates && emp.medicalLeaveDates.includes(dateStr)) status = 'BAJA';
 
-        // Check if it's a vacation day
-        if (emp.vacationDates.includes(dateStr)) {
-          newShifts.push({ employeeId: emp.id, date: dateStr, type: 'VAC' });
-          lastShiftType = 'VAC';
-          return;
-        }
-
-        // Check if it's a medical leave day
-        if (emp.medicalLeaveDates && emp.medicalLeaveDates.includes(dateStr)) {
-          newShifts.push({ employeeId: emp.id, date: dateStr, type: 'BAJA' });
-          lastShiftType = 'BAJA';
-          return;
-        }
-
-        // Basic rotation for M/T/P with rest constraint
-        let type: ShiftType;
-        
-        if (config.hasSplitShifts) {
-          // Rotation that minimizes T -> M conflicts: M -> P -> T
-          const types: ShiftType[] = ['M', 'P', 'T'];
-          type = types[(dayIndex + empIndex) % 3];
+        if (status) {
+          newShifts.push({ employeeId: emp.id, date: dateStr, type: status });
+          lastShiftMap.set(emp.id, status);
         } else {
-          type = (dayIndex + empIndex) % 2 === 0 ? 'M' : 'T';
+          availableEmployees.push(emp);
+        }
+      });
+
+      const N = availableEmployees.length;
+      if (N === 0) return;
+
+      // Calculate targets for the day (45% M, 45% T, 10% P)
+      let targetP = config.hasSplitShifts ? Math.max(1, Math.round(N * 0.1)) : 0;
+      if (N < 5 && config.hasSplitShifts) targetP = 0; // Don't force P if too few people
+      
+      let remaining = N - targetP;
+      let targetM = Math.floor(remaining / 2);
+      let targetT = remaining - targetM;
+
+      // Randomize available employees but prioritize those with fewer total shifts to keep it fair
+      const sortedEmployees = [...availableEmployees].sort((a, b) => {
+        const aTotal = (mCountMap.get(a.id) || 0) + (tCountMap.get(a.id) || 0);
+        const bTotal = (mCountMap.get(b.id) || 0) + (tCountMap.get(b.id) || 0);
+        return aTotal - bTotal || Math.random() - 0.5;
+      });
+
+      // Handle "No M after T" constraint
+      const restrictedFromM = sortedEmployees.filter(emp => lastShiftMap.get(emp.id) === 'T');
+      const freeToM = sortedEmployees.filter(emp => lastShiftMap.get(emp.id) !== 'T');
+
+      const dayAssignments = new Map<string, ShiftType>();
+
+      // Assign shifts to restricted employees first (they MUST be T or P)
+      restrictedFromM.forEach(emp => {
+        let type: ShiftType;
+        if (targetT > 0 && targetP > 0) {
+          type = Math.random() < 0.8 ? 'T' : 'P';
+          if (type === 'T') targetT--; else targetP--;
+        } else if (targetT > 0) {
+          type = 'T';
+          targetT--;
+        } else if (targetP > 0) {
+          type = 'P';
+          targetP--;
+        } else {
+          type = 'M'; // Emergency fallback
+          targetM--;
+        }
+        dayAssignments.set(emp.id, type);
+      });
+
+      // Assign remaining shifts to freeToM
+      freeToM.forEach(emp => {
+        const mVal = mCountMap.get(emp.id) || 0;
+        const tVal = tCountMap.get(emp.id) || 0;
+
+        let type: ShiftType;
+        if (targetM > 0 && targetT > 0) {
+          // Balance based on employee's history
+          if (mVal < tVal) type = 'M';
+          else if (tVal < mVal) type = 'T';
+          else type = Math.random() < 0.5 ? 'M' : 'T';
+        } else if (targetM > 0) {
+          type = 'M';
+        } else if (targetT > 0) {
+          type = 'T';
+        } else {
+          type = 'P';
         }
 
-        // Critical Constraint: No M after T
-        if (lastShiftType === 'T' && type === 'M') {
-          type = config.hasSplitShifts ? 'P' : 'T';
-        }
+        if (type === 'M') targetM--;
+        else if (type === 'T') targetT--;
+        else targetP--;
 
-        newShifts.push({ employeeId: emp.id, date: dateStr, type });
-        lastShiftType = type;
+        dayAssignments.set(emp.id, type);
+      });
+
+      // Save assignments and update history
+      dayAssignments.forEach((type, empId) => {
+        newShifts.push({ employeeId: empId, date: dateStr, type });
+        lastShiftMap.set(empId, type);
+        if (type === 'M') mCountMap.set(empId, (mCountMap.get(empId) || 0) + 1);
+        if (type === 'T') tCountMap.set(empId, (tCountMap.get(empId) || 0) + 1);
       });
     });
 
@@ -296,22 +361,77 @@ export default function App() {
   // Calculate labor cost percentage
   const laborCostStats = useMemo(() => {
     const totalHours = employees.reduce((acc, emp) => acc + emp.weeklyHours, 0);
-    // Formula: ventas€ / (2.000€ x trabajador de 40h semanales)
-    // 2000€ is the monthly cost for 40h/week. 
-    // For a week, that's roughly 500€.
-    const monthlySalesTarget = config.salesTarget * 4;
-    const totalFullTimeEquivalent = totalHours / 40;
-    const totalMonthlyCost = totalFullTimeEquivalent * 2000;
+    const totalMonthlyCost = employees.reduce((acc, emp) => acc + (emp.monthlyCost || 0), 0);
     
-    const percentage = (totalMonthlyCost / monthlySalesTarget) * 100;
+    // Sales target is monthly
+    const percentage = config.salesTarget > 0 ? (totalMonthlyCost / config.salesTarget) * 100 : 0;
 
     return {
       totalHours,
-      totalFullTimeEquivalent,
+      totalFullTimeEquivalent: totalHours / 40,
       totalMonthlyCost,
       percentage: percentage.toFixed(1)
     };
   }, [employees, config.salesTarget]);
+
+  const downloadPDF = () => {
+    if (quadrant.length === 0) return;
+
+    const doc = new jsPDF('l', 'mm', 'a4');
+    const monthYear = format(currentPeriodStart, 'MM/yy');
+    const title = `cuadrante ${monthYear}`;
+
+    // Split periodDays into weeks
+    const weeks: Date[][] = [];
+    for (let i = 0; i < periodDays.length; i += 7) {
+      weeks.push(periodDays.slice(i, i + 7));
+    }
+
+    weeks.forEach((week, weekIndex) => {
+      if (weekIndex > 0) doc.addPage();
+
+      doc.setFontSize(16);
+      doc.text(title, 14, 15);
+      doc.setFontSize(10);
+      doc.text(`Semana ${weekIndex + 1}`, 14, 22);
+
+      const tableData: any[][] = [];
+      const headers = ['Empleado', ...week.map(d => format(d, 'EEEE d', { locale: es }))];
+
+      employees.forEach(emp => {
+        const row = [
+          { content: `${emp.firstName} ${emp.lastName}`, styles: { fontStyle: 'bold' } },
+          ...week.map(day => {
+            const dateStr = format(day, 'yyyy-MM-dd');
+            const shift = quadrant.find(s => s.employeeId === emp.id && s.date === dateStr);
+            return shift?.type === 'OFF' ? '-' : (shift?.type || '-');
+          })
+        ];
+        tableData.push(row);
+      });
+
+      autoTable(doc, {
+        head: [headers],
+        body: tableData,
+        startY: 28,
+        theme: 'grid',
+        styles: { fontSize: 8, cellPadding: 2 },
+        headStyles: { fillColor: [16, 185, 129], textColor: 255 },
+        didParseCell: (data) => {
+          if (data.section === 'body' && data.column.index > 0) {
+            const val = data.cell.text[0];
+            if (val === 'M') data.cell.styles.fillColor = [209, 250, 229]; // Green
+            if (val === 'T') data.cell.styles.fillColor = [254, 249, 195]; // Yellow
+            if (val === 'P') data.cell.styles.fillColor = [255, 237, 213]; // Orange
+            if (val === 'VAC') data.cell.styles.fillColor = [236, 253, 245];
+            if (val === 'BAJA') data.cell.styles.fillColor = [254, 226, 226];
+          }
+        }
+      });
+    });
+
+    doc.save(`${title}.pdf`);
+  };
 
   return (
     <div className="min-h-screen bg-[#F8F9FA] text-[#1A1A1A] font-sans">
@@ -432,7 +552,7 @@ export default function App() {
                     </div>
 
                     <div className="space-y-4">
-                      <label className="block text-sm font-semibold uppercase tracking-wider text-gray-400">Objetivo Ventas Semanal (€)</label>
+                      <label className="block text-sm font-semibold uppercase tracking-wider text-gray-400">Objetivo Ventas Mensual (€)</label>
                       <input 
                         type="number"
                         className="w-full p-4 rounded-2xl border-2 border-gray-100 focus:border-emerald-500 outline-none transition-all"
@@ -585,9 +705,13 @@ export default function App() {
                         </div>
                         <button 
                           onClick={() => {
-                            const empId = (document.getElementById('vacation-employee-select') as HTMLSelectElement).value;
-                            const start = (document.getElementById('vacation-start') as HTMLInputElement).value;
-                            const end = (document.getElementById('vacation-end') as HTMLInputElement).value;
+                            const empSelect = document.getElementById('vacation-employee-select') as HTMLSelectElement;
+                            const startInput = document.getElementById('vacation-start') as HTMLInputElement;
+                            const endInput = document.getElementById('vacation-end') as HTMLInputElement;
+                            
+                            const empId = empSelect.value;
+                            const start = startInput.value;
+                            const end = endInput.value;
                             
                             if (!empId || !start || !end) return;
                             
@@ -601,7 +725,7 @@ export default function App() {
                               curr.setDate(curr.getDate() + 1);
                             }
                             
-                            setEmployees(prev => prev.map(emp => {
+                            const updatedEmployees = employees.map(emp => {
                               if (emp.id === empId) {
                                 return {
                                   ...emp,
@@ -609,7 +733,19 @@ export default function App() {
                                 };
                               }
                               return emp;
-                            }));
+                            });
+
+                            setEmployees(updatedEmployees);
+                            
+                            // Clear inputs
+                            empSelect.value = "";
+                            startInput.value = "";
+                            endInput.value = "";
+
+                            // Regenerate if quadrant exists
+                            if (quadrant.length > 0) {
+                              generateQuadrant(updatedEmployees);
+                            }
                           }}
                           className="bg-emerald-500 text-white p-3 rounded-xl font-bold hover:bg-emerald-600 transition-all shadow-lg shadow-emerald-200 flex items-center justify-center"
                         >
@@ -746,23 +882,36 @@ export default function App() {
                   onClick={() => setActiveTab('settings')}
                 />
               </nav>
-
-              <div className="p-6">
-                <div className="bg-emerald-50 rounded-2xl p-4 border border-emerald-100">
-                  <p className="text-xs font-bold text-emerald-800 uppercase tracking-wider mb-1">Coste Personal</p>
-                  <p className="text-2xl font-black text-emerald-600">{laborCostStats.percentage}%</p>
-                  <div className="w-full bg-emerald-200 h-1.5 rounded-full mt-2 overflow-hidden">
-                    <div 
-                      className="bg-emerald-500 h-full rounded-full transition-all duration-1000" 
-                      style={{ width: `${Math.min(Number(laborCostStats.percentage), 100)}%` }}
-                    />
-                  </div>
-                </div>
-              </div>
             </aside>
 
             {/* Main Content */}
             <main className="flex-1 overflow-y-auto p-10">
+              <div className="flex justify-center mb-8">
+                <div className="bg-white rounded-3xl p-6 border border-black/5 shadow-sm flex items-center gap-6 min-w-[300px]">
+                  <div className="w-12 h-12 bg-emerald-500 rounded-2xl flex items-center justify-center text-white shadow-lg shadow-emerald-200">
+                    <TrendingUp className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-1">Coste de Personal</p>
+                    <div className="flex items-baseline gap-2">
+                      <p className="text-3xl font-black text-emerald-600">{laborCostStats.percentage}%</p>
+                      <p className="text-xs text-gray-400">s/ ventas</p>
+                    </div>
+                  </div>
+                  <div className="flex-1 ml-4">
+                    <div className="w-full bg-gray-100 h-2 rounded-full overflow-hidden">
+                      <div 
+                        className={cn(
+                          "h-full rounded-full transition-all duration-1000",
+                          Number(laborCostStats.percentage) > 35 ? "bg-red-500" : "bg-emerald-500"
+                        )}
+                        style={{ width: `${Math.min(Number(laborCostStats.percentage), 100)}%` }}
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <header className="flex justify-between items-center mb-10">
                 <div>
                   <h2 className="text-3xl font-bold tracking-tight">
@@ -772,7 +921,7 @@ export default function App() {
                     {activeTab === 'settings' && 'Configuración General'}
                   </h2>
                   <p className="text-gray-500">
-                    {activeTab === 'quadrant' && 'Semana del ' + format(currentWeekStart, "d 'de' MMMM", { locale: es })}
+                    {activeTab === 'quadrant' && 'Periodo desde el ' + format(currentPeriodStart, "d 'de' MMMM", { locale: es })}
                     {activeTab === 'employees' && 'Administra los perfiles y jornadas de tu personal'}
                     {activeTab === 'analytics' && 'Predicciones de IA y control de costes'}
                     {activeTab === 'settings' && 'Personaliza las reglas de negocio'}
@@ -780,6 +929,30 @@ export default function App() {
                 </div>
                 
                 <div className="flex gap-3">
+                  {activeTab === 'quadrant' && (
+                    <>
+                      <div className="flex bg-white border border-gray-200 rounded-2xl p-1 shadow-sm">
+                        {(['week', 'fortnight', 'month'] as const).map((mode) => (
+                          <button
+                            key={mode}
+                            onClick={() => setViewMode(mode)}
+                            className={cn(
+                              "px-4 py-2 rounded-xl text-xs font-bold transition-all",
+                              viewMode === mode ? "bg-emerald-500 text-white shadow-md" : "text-gray-500 hover:bg-gray-50"
+                            )}
+                          >
+                            {mode === 'week' ? 'Semana' : mode === 'fortnight' ? 'Quincena' : 'Mes'}
+                          </button>
+                        ))}
+                      </div>
+                      <button 
+                        onClick={downloadPDF}
+                        className="bg-white border border-gray-200 p-3 rounded-2xl hover:bg-gray-50 transition-all shadow-sm flex items-center gap-2 text-sm font-bold"
+                      >
+                        <Download className="w-5 h-5 text-blue-500" /> Descargar PDF
+                      </button>
+                    </>
+                  )}
                   <button 
                     onClick={analyzeWithAI}
                     className="bg-white border border-gray-200 p-3 rounded-2xl hover:bg-gray-50 transition-all shadow-sm flex items-center gap-2 text-sm font-bold"
@@ -787,7 +960,7 @@ export default function App() {
                     <TrendingUp className="w-5 h-5 text-emerald-500" /> Analizar con IA
                   </button>
                   <button 
-                    onClick={generateQuadrant}
+                    onClick={() => generateQuadrant()}
                     disabled={isGenerating}
                     className="bg-emerald-500 text-white px-6 py-3 rounded-2xl font-bold hover:bg-emerald-600 transition-all shadow-lg shadow-emerald-200 flex items-center gap-2 disabled:opacity-50"
                   >
@@ -806,95 +979,70 @@ export default function App() {
                     exit={{ opacity: 0, x: -20 }}
                     className="space-y-6"
                   >
-                    <div className="bg-white rounded-3xl border border-black/5 shadow-sm overflow-hidden">
-                      <div className="grid grid-cols-8 border-b border-gray-100 bg-gray-50/50">
-                        <div className="p-4 font-bold text-xs uppercase tracking-wider text-gray-400 border-r border-gray-100">Empleado</div>
-                        {weekDays.map(day => (
-                          <div key={day.toString()} className="p-4 text-center border-r border-gray-100 last:border-r-0">
-                            <p className="text-xs font-bold uppercase tracking-wider text-gray-400">{format(day, 'EEE', { locale: es })}</p>
-                            <p className="text-lg font-black">{format(day, 'd')}</p>
-                          </div>
-                        ))}
-                      </div>
-
-                      {(['cocina', 'sala', 'refuerzo'] as Position[]).map(pos => {
-                        const posEmployees = employees.filter(e => e.position === pos);
-                        if (posEmployees.length === 0 && pos !== 'refuerzo') return null;
-
-                        return (
-                          <React.Fragment key={pos}>
-                            <div className="bg-gray-100/50 px-4 py-2 font-black text-[10px] uppercase tracking-[0.2em] text-gray-500 border-b border-gray-100 flex items-center justify-between">
-                              <span>{pos === 'cocina' ? 'Cocina' : pos === 'sala' ? 'Sala' : 'Refuerzo'}</span>
-                              {pos === 'refuerzo' && (
-                                <button 
-                                  onClick={() => addEmployee({
-                                    id: `ref-${Date.now()}`,
-                                    firstName: 'Refuerzo',
-                                    lastName: (employees.filter(e => e.position === 'refuerzo').length + 1).toString(),
-                                    weeklyHours: 0,
-                                    restDaysPerWeek: 0,
-                                    vacationDays: 0,
-                                    vacationDates: [],
-                                    medicalLeaveDates: [],
-                                    position: 'refuerzo',
-                                    isRefuerzo: true
-                                  })}
-                                  className="text-[10px] bg-white border border-gray-200 px-2 py-1 rounded-md hover:bg-gray-50 transition-all"
-                                >
-                                  + Añadir Refuerzo
-                                </button>
-                              )}
-                            </div>
-                            {posEmployees.map(emp => (
-                              <div key={emp.id} className="grid grid-cols-8 border-b border-gray-100 last:border-b-0 group">
-                                <div className="p-4 border-r border-gray-100 flex items-center gap-3">
-                                  <div className={cn(
-                                    "w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold relative",
-                                    emp.position === 'cocina' ? "bg-orange-100 text-orange-700" : 
-                                    emp.position === 'sala' ? "bg-blue-100 text-blue-700" : "bg-purple-100 text-purple-700"
-                                  )}>
-                                    {emp.firstName[0]}{emp.lastName[0]}
-                                    {emp.isRefuerzo && (
-                                      <div className="absolute -top-1 -right-1 w-2.5 h-2.5 bg-amber-500 rounded-full border border-white" />
-                                    )}
-                                  </div>
-                                  <div className="truncate">
-                                    <p className="font-bold text-sm truncate">{emp.firstName} {emp.lastName}</p>
-                                    <p className="text-[10px] text-gray-400 uppercase font-bold">{emp.weeklyHours}h</p>
-                                  </div>
-                                </div>
-                                {weekDays.map(day => {
-                                  const dateStr = format(day, 'yyyy-MM-dd');
-                                  const shift = quadrant.find(s => s.employeeId === emp.id && s.date === dateStr);
-                                  
-                                  // Check for T -> M conflict (minimum rest)
-                                  const prevDate = format(addDays(day, -1), 'yyyy-MM-dd');
-                                  const prevShift = quadrant.find(s => s.employeeId === emp.id && s.date === prevDate);
-                                  const isConflict = shift?.type === 'M' && prevShift?.type === 'T';
-
-                                  return (
-                                    <div key={day.toString()} className="p-2 border-r border-gray-100 last:border-r-0 flex items-center justify-center">
-                                      <ShiftSelector 
-                                        employeeId={emp.id} 
-                                        date={dateStr} 
-                                        hasSplit={config.hasSplitShifts}
-                                        initialType={shift?.type}
-                                        hasConflict={isConflict}
-                                        onChange={(newType) => {
-                                          setQuadrant(prev => {
-                                            const filtered = prev.filter(s => !(s.employeeId === emp.id && s.date === dateStr));
-                                            return [...filtered, { employeeId: emp.id, date: dateStr, type: newType }];
-                                          });
-                                        }}
-                                      />
-                                    </div>
-                                  );
-                                })}
+                    <div className="bg-white rounded-3xl border border-black/5 shadow-sm overflow-hidden flex flex-col">
+                      <div className="overflow-x-auto">
+                        <div className="min-w-max">
+                          <div className="flex border-b border-gray-100 bg-gray-50/50 sticky top-0 z-20">
+                            <div className="w-48 p-4 font-bold text-xs uppercase tracking-wider text-gray-400 border-r border-gray-100 bg-gray-50/50 sticky left-0 z-30">Empleado</div>
+                            {periodDays.map(day => (
+                              <div key={day.toString()} className="w-12 p-3 text-center border-r border-gray-100 last:border-r-0 flex flex-col items-center justify-center">
+                                <p className="text-[10px] font-bold uppercase tracking-wider text-gray-400">{format(day, 'EEEEE', { locale: es })}</p>
+                                <p className="text-sm font-black">{format(day, 'd')}</p>
                               </div>
                             ))}
-                          </React.Fragment>
-                        );
-                      })}
+                          </div>
+
+                          <div className="divide-y divide-gray-100">
+                            {employees.map(emp => (
+                              <div key={emp.id} className="flex border-b border-gray-100 last:border-b-0 group">
+                                    <div className="w-48 p-3 border-r border-gray-100 flex items-center gap-3 sticky left-0 z-10 bg-white group-hover:bg-gray-50 transition-colors">
+                                      <div className={cn(
+                                        "w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold shrink-0 relative",
+                                        emp.position === 'cocina' ? "bg-orange-100 text-orange-700" : 
+                                        emp.position === 'sala' ? "bg-blue-100 text-blue-700" : "bg-purple-100 text-purple-700"
+                                      )}>
+                                        {emp.firstName[0]}{emp.lastName[0]}
+                                        {emp.isRefuerzo && (
+                                          <div className="absolute -top-1 -right-1 w-2.5 h-2.5 bg-amber-500 rounded-full border border-white" />
+                                        )}
+                                      </div>
+                                      <div className="truncate">
+                                        <p className="font-bold text-xs truncate">{emp.firstName} {emp.lastName}</p>
+                                        <p className="text-[9px] text-gray-400 uppercase font-bold">{emp.weeklyHours}h</p>
+                                      </div>
+                                    </div>
+                                    {periodDays.map(day => {
+                                      const dateStr = format(day, 'yyyy-MM-dd');
+                                      const shift = quadrant.find(s => s.employeeId === emp.id && s.date === dateStr);
+                                      
+                                      // Check for T -> M conflict (minimum rest)
+                                      const prevDate = format(addDays(day, -1), 'yyyy-MM-dd');
+                                      const prevShift = quadrant.find(s => s.employeeId === emp.id && s.date === prevDate);
+                                      const isConflict = shift?.type === 'M' && prevShift?.type === 'T';
+
+                                      return (
+                                        <div key={day.toString()} className="w-12 p-1 border-r border-gray-100 last:border-r-0 flex items-center justify-center bg-white group-hover:bg-gray-50 transition-colors">
+                                          <ShiftSelector 
+                                            employeeId={emp.id} 
+                                            date={dateStr} 
+                                            hasSplit={config.hasSplitShifts}
+                                            initialType={shift?.type}
+                                            hasConflict={isConflict}
+                                            onChange={(newType) => {
+                                              setQuadrant(prev => {
+                                                const filtered = prev.filter(s => !(s.employeeId === emp.id && s.date === dateStr));
+                                                return [...filtered, { employeeId: emp.id, date: dateStr, type: newType }];
+                                              });
+                                            }}
+                                          />
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
                     </div>
 
                     <div className="bg-white rounded-3xl border border-black/5 p-8 shadow-sm">
@@ -925,9 +1073,13 @@ export default function App() {
                         </div>
                         <button 
                           onClick={() => {
-                            const empId = (document.getElementById('medical-employee-select') as HTMLSelectElement).value;
-                            const start = (document.getElementById('medical-start') as HTMLInputElement).value;
-                            const end = (document.getElementById('medical-end') as HTMLInputElement).value;
+                            const empSelect = document.getElementById('medical-employee-select') as HTMLSelectElement;
+                            const startInput = document.getElementById('medical-start') as HTMLInputElement;
+                            const endInput = document.getElementById('medical-end') as HTMLInputElement;
+
+                            const empId = empSelect.value;
+                            const start = startInput.value;
+                            const end = endInput.value;
                             
                             if (!empId || !start || !end) return;
                             
@@ -941,7 +1093,7 @@ export default function App() {
                               curr.setDate(curr.getDate() + 1);
                             }
                             
-                            setEmployees(prev => prev.map(emp => {
+                            const updatedEmployees = employees.map(emp => {
                               if (emp.id === empId) {
                                 return {
                                   ...emp,
@@ -949,10 +1101,17 @@ export default function App() {
                                 };
                               }
                               return emp;
-                            }));
+                            });
+
+                            setEmployees(updatedEmployees);
                             
-                            // Trigger regeneration
-                            generateQuadrant();
+                            // Clear inputs
+                            empSelect.value = "";
+                            startInput.value = "";
+                            endInput.value = "";
+                            
+                            // Trigger regeneration with updated data
+                            generateQuadrant(updatedEmployees);
                           }}
                           className="bg-red-500 text-white p-3 rounded-xl font-bold hover:bg-red-600 transition-all shadow-lg shadow-red-200 flex items-center justify-center gap-2"
                         >
@@ -1183,7 +1342,7 @@ export default function App() {
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
                         <div className="space-y-6">
                           <div className="space-y-2">
-                            <label className="text-xs font-bold uppercase tracking-wider text-gray-400">Objetivo Ventas Semanal (€)</label>
+                            <label className="text-xs font-bold uppercase tracking-wider text-gray-400">Objetivo Ventas Mensual (€)</label>
                             <input 
                               type="number"
                               className="w-full p-4 rounded-2xl border border-gray-100 focus:border-emerald-500 outline-none transition-all bg-gray-50"
@@ -1306,7 +1465,8 @@ function EmployeeForm({ onAdd }: { onAdd: (e: Employee) => void }) {
     restDays: 2,
     vacations: 30,
     position: 'sala' as Position,
-    isRefuerzo: false
+    isRefuerzo: false,
+    monthlyCost: 0
   });
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -1323,14 +1483,15 @@ function EmployeeForm({ onAdd }: { onAdd: (e: Employee) => void }) {
       vacationDates: [],
       medicalLeaveDates: [],
       position: formData.position,
-      isRefuerzo: formData.isRefuerzo
+      isRefuerzo: formData.isRefuerzo,
+      monthlyCost: formData.monthlyCost
     });
     
-    setFormData({ ...formData, firstName: '', lastName: '', isRefuerzo: false, weeklyHours: 40, restDays: 2, vacations: 30, position: 'sala' });
+    setFormData({ ...formData, firstName: '', lastName: '', isRefuerzo: false, weeklyHours: 40, restDays: 2, vacations: 30, position: 'sala', monthlyCost: 0 });
   };
 
   return (
-    <form onSubmit={handleSubmit} className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-7 gap-4 items-end">
+    <form onSubmit={handleSubmit} className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-8 gap-4 items-end">
       <div className="space-y-2">
         <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Nombre</label>
         <input 
@@ -1377,6 +1538,16 @@ function EmployeeForm({ onAdd }: { onAdd: (e: Employee) => void }) {
         </select>
       </div>
       <div className="space-y-2">
+        <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Coste Mensual (€)</label>
+        <input 
+          type="number" 
+          placeholder="0"
+          className="w-full p-3 rounded-xl border border-gray-200 focus:border-emerald-500 outline-none bg-white text-sm"
+          value={formData.monthlyCost}
+          onChange={e => setFormData({...formData, monthlyCost: Number(e.target.value)})}
+        />
+      </div>
+      <div className="space-y-2">
         <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Descansos</label>
         <select 
           className="w-full p-3 rounded-xl border border-gray-200 focus:border-emerald-500 outline-none bg-white text-sm"
@@ -1416,10 +1587,10 @@ function ShiftSelector({ employeeId, date, hasSplit, initialType, hasConflict, o
   const getStyle = (t: ShiftType) => {
     if (hasConflict && t === 'M') return "bg-red-50 text-red-700 border-red-200 ring-2 ring-red-500 ring-offset-1";
     switch(t) {
-      case 'M': return "bg-amber-100 text-amber-700 border-amber-200";
-      case 'T': return "bg-indigo-100 text-indigo-700 border-indigo-200";
-      case 'P': return "bg-purple-100 text-purple-700 border-purple-200";
-      case 'VAC': return "bg-emerald-100 text-emerald-700 border-emerald-200";
+      case 'M': return "bg-emerald-100 text-emerald-700 border-emerald-200"; // Green
+      case 'T': return "bg-yellow-100 text-yellow-700 border-yellow-200"; // Yellow
+      case 'P': return "bg-orange-100 text-orange-700 border-orange-200"; // Orange
+      case 'VAC': return "bg-blue-100 text-blue-700 border-blue-200";
       case 'BAJA': return "bg-red-100 text-red-700 border-red-200";
       default: return "bg-gray-50 text-gray-400 border-gray-100";
     }
@@ -1442,7 +1613,7 @@ function ShiftSelector({ employeeId, date, hasSplit, initialType, hasConflict, o
     <button 
       onClick={cycleShift}
       className={cn(
-        "w-full h-10 rounded-lg border text-[10px] font-black transition-all flex items-center justify-center relative",
+        "w-full h-10 rounded-lg border text-xs font-black transition-all flex items-center justify-center relative",
         getStyle(type)
       )}
       title={hasConflict ? "Conflicto de descanso: No puede haber turno M después de T" : ""}
