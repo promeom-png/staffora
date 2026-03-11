@@ -38,6 +38,8 @@ export interface RestaurantConfig {
     afternoon: number;
   };
   salesTarget: number;
+  targetPersonnelCost: number;
+  vatRate: number;
 }
 
 export interface Shift {

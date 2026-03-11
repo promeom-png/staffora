@@ -1,6 +1,6 @@
-# 👨‍🍳 Staffora
+# 👨‍🍳 Staffore
 
-**Staffora** es una herramienta inteligente de gestión de cuadrantes y optimización de personal diseñada específicamente para el sector de la restauración. Permite generar horarios eficientes, controlar costes de personal y asegurar el cumplimiento de normativas de descanso mediante Inteligencia Artificial.
+**Staffore** es una herramienta inteligente de gestión de cuadrantes y optimización de personal diseñada específicamente para el sector de la restauración. Permite generar horarios eficientes, controlar costes de personal y asegurar el cumplimiento de normativas de descanso mediante Inteligencia Artificial.
 
 ## 🚀 Características Principales
 

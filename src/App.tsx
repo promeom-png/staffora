@@ -49,7 +49,7 @@ function cn(...inputs: ClassValue[]) {
 }
 
 export default function App() {
-  const [step, setStep] = useState<'setup' | 'dashboard'>('setup');
+  const [step, setStep] = useState<'landing' | 'setup' | 'dashboard'>('landing');
   const [config, setConfig] = useState<RestaurantConfig>({
     hasSplitShifts: true,
     standardWeeklyHours: [40, 38, 30, 20],
@@ -67,6 +67,8 @@ export default function App() {
     },
     minStaffPerShift: { morning: 2, afternoon: 2 },
     salesTarget: 15000,
+    targetPersonnelCost: 38.5,
+    vatRate: 10,
   });
 
   const [employees, setEmployees] = useState<Employee[]>([]);
@@ -331,7 +333,10 @@ export default function App() {
       Configuración:
       - Empleados: ${employees.length}
       - Turnos partidos: ${config.hasSplitShifts ? 'Sí' : 'No'}
-      - Objetivo Ventas: ${config.salesTarget}€
+      - Objetivo Ventas Mensual (Bruto): ${config.salesTarget}€
+      - Tipo de IVA: ${config.vatRate}%
+      - Ventas Netas Estimadas: ${laborCostStats.netSales.toFixed(2)}€
+      - Coste Personal Objetivo: ${config.targetPersonnelCost}%
       - Regla: Viernes y Sábados requieren +1 persona de refuerzo.
       - Restricción: No puede haber un turno de Mañana (M) después de uno de Tarde (T) en días consecutivos.
       
@@ -363,16 +368,18 @@ export default function App() {
     const totalHours = employees.reduce((acc, emp) => acc + emp.weeklyHours, 0);
     const totalMonthlyCost = employees.reduce((acc, emp) => acc + (emp.monthlyCost || 0), 0);
     
-    // Sales target is monthly
-    const percentage = config.salesTarget > 0 ? (totalMonthlyCost / config.salesTarget) * 100 : 0;
+    // Sales target is monthly and gross (IVA included)
+    const netSales = config.salesTarget / (1 + config.vatRate / 100);
+    const percentage = netSales > 0 ? (totalMonthlyCost / netSales) * 100 : 0;
 
     return {
       totalHours,
       totalFullTimeEquivalent: totalHours / 40,
       totalMonthlyCost,
+      netSales,
       percentage: percentage.toFixed(1)
     };
-  }, [employees, config.salesTarget]);
+  }, [employees, config.salesTarget, config.vatRate]);
 
   const downloadPDF = () => {
     if (quadrant.length === 0) return;
@@ -436,7 +443,57 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[#F8F9FA] text-[#1A1A1A] font-sans">
       <AnimatePresence mode="wait">
-        {step === 'setup' ? (
+        {step === 'landing' ? (
+          <motion.div
+            key="landing"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="min-h-screen flex flex-col items-center justify-center p-6 bg-white"
+          >
+            <div className="max-w-3xl w-full text-center space-y-12">
+              <div className="flex flex-col items-center gap-4">
+                <motion.div 
+                  initial={{ scale: 0.8, opacity: 0 }}
+                  animate={{ scale: 1, opacity: 1 }}
+                  transition={{ delay: 0.2, type: "spring" }}
+                  className="w-24 h-24 bg-emerald-500 rounded-[2.5rem] flex items-center justify-center text-white shadow-2xl shadow-emerald-200 mb-4"
+                >
+                  <ChefHat className="w-12 h-12" />
+                </motion.div>
+                <motion.h1 
+                  initial={{ y: 20, opacity: 0 }}
+                  animate={{ y: 0, opacity: 1 }}
+                  transition={{ delay: 0.3 }}
+                  className="text-7xl font-black tracking-tighter text-gray-900"
+                >
+                  Staffore
+                </motion.h1>
+              </div>
+
+              <motion.div 
+                initial={{ y: 20, opacity: 0 }}
+                animate={{ y: 0, opacity: 1 }}
+                transition={{ delay: 0.4 }}
+                className="space-y-10"
+              >
+                <button
+                  onClick={() => {
+                    setStep('dashboard');
+                    setActiveTab('settings');
+                  }}
+                  className="group relative inline-flex items-center justify-center px-16 py-6 font-bold text-white transition-all duration-300 bg-emerald-500 rounded-3xl focus:outline-none focus:ring-4 focus:ring-emerald-500/20 hover:bg-emerald-600 shadow-2xl shadow-emerald-500/30 hover:scale-105 active:scale-95"
+                >
+                  Iniciar Sesión
+                </button>
+
+                <p className="text-lg text-gray-500 leading-relaxed max-w-2xl mx-auto font-medium px-4">
+                  #Staffore is a powerful SaaS platform that enables franchise chains to effortlessly generate, optimize, and manage monthly employee shift schedules, ensuring legal compliance, cost control, and efficient coverage using real-time KPIs and advanced shift optimization logic.
+                </p>
+              </motion.div>
+            </div>
+          </motion.div>
+        ) : step === 'setup' ? (
           <motion.div 
             key="setup"
             initial={{ opacity: 0, y: 20 }}
@@ -450,7 +507,7 @@ export default function App() {
                   <ChefHat className="w-6 h-6" />
                 </div>
                 <div>
-                  <h1 className="text-3xl font-bold tracking-tight">Staffora</h1>
+                  <h1 className="text-3xl font-bold tracking-tight">Staffore</h1>
                   <p className="text-gray-500">Configuración Inicial</p>
                 </div>
               </div>
@@ -552,13 +609,27 @@ export default function App() {
                     </div>
 
                     <div className="space-y-4">
-                      <label className="block text-sm font-semibold uppercase tracking-wider text-gray-400">Objetivo Ventas Mensual (€)</label>
+                      <label className="block text-sm font-semibold uppercase tracking-wider text-gray-400">Objetivo Ventas Mensual (Bruto €)</label>
                       <input 
                         type="number"
                         className="w-full p-4 rounded-2xl border-2 border-gray-100 focus:border-emerald-500 outline-none transition-all"
                         value={config.salesTarget}
                         onChange={(e) => setConfig({...config, salesTarget: Number(e.target.value)})}
                       />
+                    </div>
+
+                    <div className="space-y-4">
+                      <label className="block text-sm font-semibold uppercase tracking-wider text-gray-400">Tipo de IVA (%)</label>
+                      <select 
+                        className="w-full p-4 rounded-2xl border-2 border-gray-100 focus:border-emerald-500 outline-none transition-all bg-white"
+                        value={config.vatRate}
+                        onChange={(e) => setConfig({...config, vatRate: Number(e.target.value)})}
+                      >
+                        <option value={10}>10% (Restauración)</option>
+                        <option value={21}>21% (General)</option>
+                        <option value={4}>4% (Superreducido)</option>
+                        <option value={0}>0% (Exento)</option>
+                      </select>
                     </div>
                   </div>
 
@@ -818,7 +889,9 @@ export default function App() {
                       <li>• {employees.length} empleados registrados</li>
                       <li>• Turnos {config.hasSplitShifts ? 'M, T y P' : 'M y T'}</li>
                       <li>• {config.restDaysPerWeek} días de descanso</li>
-                      <li>• Objetivo: {config.salesTarget}€ / semana</li>
+                      <li>• Objetivo: {config.salesTarget}€ / mes (Bruto)</li>
+                      <li>• IVA: {config.vatRate}%</li>
+                      <li>• Coste Objetivo: {config.targetPersonnelCost}%</li>
                     </ul>
                   </div>
 
@@ -853,7 +926,7 @@ export default function App() {
                 <div className="w-10 h-10 bg-emerald-500 rounded-xl flex items-center justify-center text-white shadow-lg shadow-emerald-200">
                   <ChefHat className="w-5 h-5" />
                 </div>
-                <span className="font-bold text-xl tracking-tight">Staffora</span>
+                <span className="font-bold text-xl tracking-tight">Staffore</span>
               </div>
 
               <nav className="flex-1 px-4 space-y-2">
@@ -895,7 +968,7 @@ export default function App() {
                     <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-1">Coste de Personal</p>
                     <div className="flex items-baseline gap-2">
                       <p className="text-3xl font-black text-emerald-600">{laborCostStats.percentage}%</p>
-                      <p className="text-xs text-gray-400">s/ ventas</p>
+                      <p className="text-xs text-gray-400">s/ ventas netas</p>
                     </div>
                   </div>
                   <div className="flex-1 ml-4">
@@ -903,7 +976,7 @@ export default function App() {
                       <div 
                         className={cn(
                           "h-full rounded-full transition-all duration-1000",
-                          Number(laborCostStats.percentage) > 35 ? "bg-red-500" : "bg-emerald-500"
+                          Number(laborCostStats.percentage) > config.targetPersonnelCost ? "bg-red-500" : "bg-emerald-500"
                         )}
                         style={{ width: `${Math.min(Number(laborCostStats.percentage), 100)}%` }}
                       />
@@ -1145,7 +1218,11 @@ export default function App() {
                         </div>
                         <div>
                           <h4 className="font-bold text-emerald-900">Objetivo de Coste</h4>
-                          <p className="text-sm text-emerald-800 opacity-80">Estás un 2.4% por debajo del límite de coste de personal. ¡Buen trabajo!</p>
+                          <p className="text-sm text-emerald-800 opacity-80">
+                            {Number(laborCostStats.percentage) <= config.targetPersonnelCost 
+                              ? `Estás un ${(config.targetPersonnelCost - Number(laborCostStats.percentage)).toFixed(1)}% por debajo del límite de coste de personal. ¡Buen trabajo!`
+                              : `Estás un ${(Number(laborCostStats.percentage) - config.targetPersonnelCost).toFixed(1)}% por encima del límite de coste de personal.`}
+                          </p>
                         </div>
                       </div>
                     </div>
@@ -1318,6 +1395,14 @@ export default function App() {
                               <p className="text-2xl font-black">{laborCostStats.totalHours}h</p>
                               <p className="text-xs text-gray-500">Total Horas Semanales</p>
                             </div>
+                            <div className="p-4 bg-gray-50 rounded-2xl">
+                              <p className="text-xl font-black">{config.salesTarget.toLocaleString()}€</p>
+                              <p className="text-xs text-gray-500">Ventas Brutas (Mes)</p>
+                            </div>
+                            <div className="p-4 bg-gray-50 rounded-2xl">
+                              <p className="text-xl font-black">{laborCostStats.netSales.toLocaleString(undefined, { maximumFractionDigits: 0 })}€</p>
+                              <p className="text-xs text-gray-500">Ventas Netas (Mes)</p>
+                            </div>
                           </div>
                         </div>
                       </div>
@@ -1342,12 +1427,37 @@ export default function App() {
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
                         <div className="space-y-6">
                           <div className="space-y-2">
-                            <label className="text-xs font-bold uppercase tracking-wider text-gray-400">Objetivo Ventas Mensual (€)</label>
+                            <label className="text-xs font-bold uppercase tracking-wider text-gray-400">Objetivo Ventas Mensual (Bruto €)</label>
                             <input 
                               type="number"
                               className="w-full p-4 rounded-2xl border border-gray-100 focus:border-emerald-500 outline-none transition-all bg-gray-50"
                               value={config.salesTarget}
                               onChange={(e) => setConfig({...config, salesTarget: Number(e.target.value)})}
+                            />
+                          </div>
+
+                          <div className="space-y-2">
+                            <label className="text-xs font-bold uppercase tracking-wider text-gray-400">Tipo de IVA (%)</label>
+                            <select 
+                              className="w-full p-4 rounded-2xl border border-gray-100 focus:border-emerald-500 outline-none transition-all bg-gray-50"
+                              value={config.vatRate}
+                              onChange={(e) => setConfig({...config, vatRate: Number(e.target.value)})}
+                            >
+                              <option value={10}>10% (Restauración)</option>
+                              <option value={21}>21% (General)</option>
+                              <option value={4}>4% (Superreducido)</option>
+                              <option value={0}>0% (Exento)</option>
+                            </select>
+                          </div>
+
+                          <div className="space-y-2">
+                            <label className="text-xs font-bold uppercase tracking-wider text-gray-400">Coste Personal Objetivo (%)</label>
+                            <input 
+                              type="number"
+                              step="0.1"
+                              className="w-full p-4 rounded-2xl border border-gray-100 focus:border-emerald-500 outline-none transition-all bg-gray-50"
+                              value={config.targetPersonnelCost}
+                              onChange={(e) => setConfig({...config, targetPersonnelCost: Number(e.target.value)})}
                             />
                           </div>
                           
