@@ -108,7 +108,9 @@ export default function App() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [aiAnalysis, setAiAnalysis] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'quadrant' | 'employees' | 'analytics' | 'settings'>('quadrant');
-  const [viewMode, setViewMode] = useState<'week' | 'fortnight' | 'month'>('fortnight');
+  const [viewMode, setViewMode] = useState<'week' | 'fortnight' | 'month'>('month');
+  const [selectedMonth, setSelectedMonth] = useState(() => format(new Date(), 'yyyy-MM'));
+  const [currentWeekIndex, setCurrentWeekIndex] = useState(0); // For week/fortnight navigation within the month
 
   useEffect(() => {
     localStorage.setItem('all_employees', JSON.stringify(allEmployees));
@@ -131,7 +133,7 @@ export default function App() {
     }
   };
 
-  const currentMonth = format(new Date(), 'yyyy-MM');
+  const currentMonth = selectedMonth;
 
   const employees = useMemo(() => {
     return allEmployees.filter(emp => emp.businessUnitId === currentUnitId);
@@ -200,61 +202,99 @@ export default function App() {
 
     const reader = new FileReader();
     reader.onload = (evt) => {
-      const bstr = evt.target?.result;
-      const wb = XLSX.read(bstr, { type: 'binary' });
-      const wsname = wb.SheetNames[0];
-      const ws = wb.Sheets[wsname];
-      const data = XLSX.utils.sheet_to_json(ws, { header: 1 }) as any[][];
+      try {
+        const data = evt.target?.result;
+        const workbook = XLSX.read(data, { type: 'array' });
+        const sheetName = workbook.SheetNames[0];
+        const worksheet = workbook.Sheets[sheetName];
+        const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1 }) as any[][];
 
-      // Assuming columns: Nombre, Posición, Jornada Semanal, Coste Mensual
-      // Skip header row
-      const newEmployees: Employee[] = data.slice(1).map((row, index) => {
-        const fullName = String(row[0] || '');
-        const [firstName, ...lastNameParts] = fullName.split(' ');
-        const lastName = lastNameParts.join(' ');
+        if (jsonData.length <= 1) {
+          console.warn("El archivo Excel parece estar vacío o solo contiene cabeceras.");
+          return;
+        }
+
+        // Columnas esperadas: nombre, posición, jornada, coste
+        const newEmployees: Employee[] = jsonData.slice(1)
+          .filter(row => row.length >= 1 && row[0]) // Filtrar filas vacías
+          .map((row, index) => {
+            const fullName = String(row[0] || '').trim();
+            const [firstName, ...lastNameParts] = fullName.split(' ');
+            const lastName = lastNameParts.join(' ') || ' ';
+            
+            const posInput = String(row[1] || '').toLowerCase();
+            const position: Position = posInput.includes('cocina') ? 'cocina' : 
+                                      posInput.includes('sala') ? 'sala' : 'refuerzo';
+            
+            const weeklyHours = Number(row[2]) || 40;
+            const monthlyCost = Number(row[3]) || 0;
+
+            return {
+              id: `excel-${Date.now()}-${index}`,
+              firstName,
+              lastName,
+              weeklyHours,
+              restDaysPerWeek: config.restDaysPerWeek,
+              vacationDays: 30,
+              vacationDates: [],
+              medicalLeaveDates: [],
+              position,
+              isRefuerzo: position === 'refuerzo',
+              monthlyCost,
+              businessUnitId: currentUnitId
+            };
+          });
+
+        if (newEmployees.length > 0) {
+          setAllEmployees(prev => [...prev, ...newEmployees]);
+        }
         
-        const posInput = String(row[1] || '').toLowerCase();
-        const position: Position = posInput.includes('cocina') ? 'cocina' : 
-                                  posInput.includes('sala') ? 'sala' : 'refuerzo';
-        
-        const weeklyHours = Number(row[2]) || 40;
-        const monthlyCost = Number(row[3]) || 0;
-
-        return {
-          id: `excel-${Date.now()}-${index}`,
-          firstName,
-          lastName,
-          weeklyHours,
-          restDaysPerWeek: config.restDaysPerWeek,
-          vacationDays: 30,
-          vacationDates: [],
-          medicalLeaveDates: [],
-          position,
-          isRefuerzo: position === 'refuerzo',
-          monthlyCost,
-          businessUnitId: currentUnitId
-        };
-      });
-
-      setAllEmployees(prev => [...prev, ...newEmployees]);
+        // Resetear el input para permitir subir el mismo archivo si se desea
+        e.target.value = '';
+      } catch (error) {
+        console.error("Error al leer el archivo Excel:", error);
+      }
     };
-    reader.readAsBinaryString(file);
+    reader.readAsArrayBuffer(file);
   };
 
   // --- Dashboard Logic ---
-  const currentPeriodStart = startOfWeek(new Date(), { weekStartsOn: 1 });
-  
-  const periodDays = useMemo(() => {
-    let end;
-    if (viewMode === 'week') end = addDays(currentPeriodStart, 6);
-    else if (viewMode === 'fortnight') end = addDays(currentPeriodStart, 13);
-    else end = addDays(currentPeriodStart, 29); // Approx month
+  useEffect(() => {
+    setCurrentWeekIndex(0);
+  }, [selectedMonth, viewMode]);
 
-    return eachDayOfInterval({
-      start: currentPeriodStart,
-      end: end
-    });
-  }, [viewMode, currentPeriodStart]);
+  const currentPeriodStart = useMemo(() => {
+    const [year, month] = selectedMonth.split('-').map(Number);
+    const monthStart = new Date(year, month - 1, 1);
+    return startOfWeek(monthStart, { weekStartsOn: 1 });
+  }, [selectedMonth]);
+
+  const periodDays = useMemo(() => {
+    const [year, month] = selectedMonth.split('-').map(Number);
+    const monthStart = new Date(year, month - 1, 1);
+    const monthEnd = new Date(year, month, 0);
+    
+    const start = startOfWeek(monthStart, { weekStartsOn: 1 });
+    const end = endOfWeek(monthEnd, { weekStartsOn: 1 });
+    
+    return eachDayOfInterval({ start, end });
+  }, [selectedMonth]);
+
+  const displayedDays = useMemo(() => {
+    if (viewMode === 'month') return periodDays;
+    
+    if (viewMode === 'week') {
+      const start = addDays(currentPeriodStart, currentWeekIndex * 7);
+      return eachDayOfInterval({ start, end: addDays(start, 6) });
+    }
+    
+    if (viewMode === 'fortnight') {
+      const start = addDays(currentPeriodStart, currentWeekIndex * 14);
+      return eachDayOfInterval({ start, end: addDays(start, 13) });
+    }
+    
+    return periodDays;
+  }, [periodDays, viewMode, currentWeekIndex, currentPeriodStart]);
 
   const generateQuadrant = (employeesOverride?: Employee[]) => {
     if (isPublished) {
@@ -489,21 +529,26 @@ export default function App() {
 
     const doc = new jsPDF('l', 'mm', 'a4');
     const monthYear = format(currentPeriodStart, 'MM/yy');
-    const title = `cuadrante ${monthYear}`;
+    const title = `cuadrante_${monthYear}_${viewMode}`;
 
-    // Split periodDays into weeks
+    // Use displayedDays for the PDF content
+    const daysToPrint = displayedDays;
+    
+    // Split into weeks for better layout if needed, but for PDF we can try to fit the view
     const weeks: Date[][] = [];
-    for (let i = 0; i < periodDays.length; i += 7) {
-      weeks.push(periodDays.slice(i, i + 7));
+    for (let i = 0; i < daysToPrint.length; i += 7) {
+      weeks.push(daysToPrint.slice(i, i + 7));
     }
 
     weeks.forEach((week, weekIndex) => {
       if (weekIndex > 0) doc.addPage();
 
       doc.setFontSize(16);
-      doc.text(title, 14, 15);
+      doc.text(`Cuadrante ${viewMode === 'week' ? 'Semanal' : viewMode === 'fortnight' ? 'Quincenal' : 'Mensual'} - ${monthYear}`, 14, 15);
       doc.setFontSize(10);
-      doc.text(`Semana ${weekIndex + 1}`, 14, 22);
+      if (viewMode !== 'month') {
+        doc.text(`${viewMode === 'week' ? 'Semana' : 'Quincena'} ${currentWeekIndex + 1}`, 14, 22);
+      }
 
       const tableData: any[][] = [];
       const headers = ['Empleado', ...week.map(d => format(d, 'EEEE d', { locale: es }))];
@@ -558,17 +603,16 @@ export default function App() {
               <div className="w-20 h-20 bg-coffee-800 rounded-3xl flex items-center justify-center text-white mb-8 mx-auto shadow-lg shadow-coffee-200">
                 <ChefHat className="w-10 h-10" />
               </div>
-              <h1 className="text-4xl font-black text-center text-coffee-900 mb-4 tracking-tight">GastroPlan</h1>
-              <p className="text-center text-gray-500 mb-10 leading-relaxed">Optimización inteligente de turnos para restauración moderna.</p>
+              <h1 className="text-4xl font-black text-center text-coffee-900 mb-4 tracking-tight">Staffore</h1>
+              <p className="text-center text-gray-500 mb-10 leading-relaxed">Optimización inteligente de turnos para restauración organizada.</p>
               
               <form onSubmit={handleLogin} className="space-y-6">
                 <div>
-                  <label className="block text-xs font-bold text-gray-400 uppercase tracking-widest mb-2 ml-1">Número de Usuario</label>
+                  <label className="block text-xs font-bold text-gray-400 uppercase tracking-widest mb-2 ml-1">Usuario</label>
                   <input 
                     type="text" 
                     value={loginId}
                     onChange={(e) => setLoginId(e.target.value)}
-                    placeholder="Ej: 001, 202..."
                     className="w-full p-4 rounded-2xl border border-gray-100 focus:border-coffee-800 outline-none transition-all bg-gray-50 text-center text-xl font-bold tracking-widest"
                   />
                   {loginError && <p className="text-red-500 text-xs mt-2 text-center font-medium">{loginError}</p>}
@@ -583,7 +627,7 @@ export default function App() {
               </form>
               
               <div className="mt-10 pt-8 border-t border-gray-50 text-center">
-                <p className="text-xs text-gray-400 font-medium">© 2024 GastroPlan AI Solutions</p>
+                <p className="text-xs text-gray-400 font-medium">© 2026 Staffore AI Solutions - Hand made by smileconsultores</p>
               </div>
             </div>
           </motion.div>
@@ -1030,7 +1074,7 @@ export default function App() {
                     <ChefHat className="w-6 h-6" />
                   </div>
                   <div>
-                    <h2 className="font-black text-xl tracking-tight">GastroPlan</h2>
+                    <h2 className="font-black text-xl tracking-tight">Staffore</h2>
                     <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Admin Panel</p>
                   </div>
                 </div>
@@ -1071,16 +1115,16 @@ export default function App() {
                     onClick={() => setActiveTab('employees')}
                   />
                   <SidebarItem 
-                    icon={<TrendingUp className="w-5 h-5" />} 
-                    label="Analíticas" 
-                    active={activeTab === 'analytics'} 
-                    onClick={() => setActiveTab('analytics')}
-                  />
-                  <SidebarItem 
                     icon={<Settings className="w-5 h-5" />} 
                     label="Ajustes" 
                     active={activeTab === 'settings'} 
                     onClick={() => setActiveTab('settings')}
+                  />
+                  <SidebarItem 
+                    icon={<TrendingUp className="w-5 h-5" />} 
+                    label="Analíticas" 
+                    active={activeTab === 'analytics'} 
+                    onClick={() => setActiveTab('analytics')}
                   />
                 </nav>
 
@@ -1110,7 +1154,12 @@ export default function App() {
                   <div>
                     <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-1">Coste de Personal</p>
                     <div className="flex items-baseline gap-2">
-                      <p className="text-3xl font-black text-coffee-800">{laborCostStats.percentage}%</p>
+                      <p className={cn(
+                        "text-3xl font-black transition-colors duration-300",
+                        Number(laborCostStats.percentage) > 39 ? "text-red-500" : "text-emerald-500"
+                      )}>
+                        {laborCostStats.percentage}%
+                      </p>
                       <p className="text-xs text-gray-400">s/ ventas netas</p>
                     </div>
                   </div>
@@ -1119,7 +1168,7 @@ export default function App() {
                       <div 
                         className={cn(
                           "h-full rounded-full transition-all duration-1000",
-                          Number(laborCostStats.percentage) > config.targetPersonnelCost ? "bg-red-500" : "bg-coffee-800"
+                          Number(laborCostStats.percentage) > 39 ? "bg-red-500" : "bg-emerald-500"
                         )}
                         style={{ width: `${Math.min(Number(laborCostStats.percentage), 100)}%` }}
                       />
@@ -1147,6 +1196,40 @@ export default function App() {
                 <div className="flex gap-3">
                   {activeTab === 'quadrant' && (
                     <>
+                      <div className="flex bg-white border border-gray-200 rounded-2xl p-1 shadow-sm items-center gap-1">
+                        <button 
+                          onClick={() => {
+                            const [y, m] = selectedMonth.split('-').map(Number);
+                            const d = new Date(y, m - 2, 1);
+                            setSelectedMonth(format(d, 'yyyy-MM'));
+                            setCurrentWeekIndex(0);
+                          }}
+                          className="p-2 hover:bg-gray-50 rounded-xl transition-all"
+                        >
+                          <ChevronLeft className="w-4 h-4" />
+                        </button>
+                        <input 
+                          type="month" 
+                          value={selectedMonth}
+                          onChange={(e) => {
+                            setSelectedMonth(e.target.value);
+                            setCurrentWeekIndex(0);
+                          }}
+                          className="bg-transparent border-none outline-none text-xs font-bold px-2 py-1 cursor-pointer"
+                        />
+                        <button 
+                          onClick={() => {
+                            const [y, m] = selectedMonth.split('-').map(Number);
+                            const d = new Date(y, m, 1);
+                            setSelectedMonth(format(d, 'yyyy-MM'));
+                            setCurrentWeekIndex(0);
+                          }}
+                          className="p-2 hover:bg-gray-50 rounded-xl transition-all"
+                        >
+                          <ChevronRight className="w-4 h-4" />
+                        </button>
+                      </div>
+
                       <button 
                         onClick={publishQuadrant}
                         disabled={isPublished}
@@ -1164,7 +1247,10 @@ export default function App() {
                         {(['week', 'fortnight', 'month'] as const).map((mode) => (
                           <button
                             key={mode}
-                            onClick={() => setViewMode(mode)}
+                            onClick={() => {
+                              setViewMode(mode);
+                              setCurrentWeekIndex(0);
+                            }}
                             className={cn(
                               "px-4 py-2 rounded-xl text-xs font-bold transition-all",
                               viewMode === mode ? "bg-coffee-800 text-white shadow-md" : "text-gray-500 hover:bg-gray-50"
@@ -1174,6 +1260,30 @@ export default function App() {
                           </button>
                         ))}
                       </div>
+
+                      {viewMode !== 'month' && (
+                        <div className="flex bg-white border border-gray-200 rounded-2xl p-1 shadow-sm items-center gap-1">
+                          <button 
+                            onClick={() => setCurrentWeekIndex(prev => Math.max(0, prev - 1))}
+                            disabled={currentWeekIndex === 0}
+                            className="p-2 hover:bg-gray-50 rounded-xl transition-all disabled:opacity-30"
+                          >
+                            <ChevronLeft className="w-4 h-4" />
+                          </button>
+                          <span className="text-[10px] font-bold px-2">
+                            {viewMode === 'week' ? `Semana ${currentWeekIndex + 1}` : `Quincena ${currentWeekIndex + 1}`}
+                          </span>
+                          <button 
+                            onClick={() => {
+                              const maxIndex = viewMode === 'week' ? Math.floor(periodDays.length / 7) - 1 : Math.floor(periodDays.length / 14) - 1;
+                              setCurrentWeekIndex(prev => Math.min(maxIndex, prev + 1));
+                            }}
+                            className="p-2 hover:bg-gray-50 rounded-xl transition-all"
+                          >
+                            <ChevronRight className="w-4 h-4" />
+                          </button>
+                        </div>
+                      )}
                       <button 
                         onClick={downloadPDF}
                         className="bg-white border border-gray-200 p-3 rounded-2xl hover:bg-gray-50 transition-all shadow-sm flex items-center gap-2 text-sm font-bold"
@@ -1213,7 +1323,7 @@ export default function App() {
                         <div className="min-w-max">
                           <div className="flex border-b border-gray-100 bg-gray-50/50 sticky top-0 z-20">
                             <div className="w-48 p-4 font-bold text-xs uppercase tracking-wider text-gray-400 border-r border-gray-100 bg-gray-50/50 sticky left-0 z-30">Empleado</div>
-                            {periodDays.map(day => (
+                            {displayedDays.map(day => (
                               <div key={day.toString()} className="w-12 p-3 text-center border-r border-gray-100 last:border-r-0 flex flex-col items-center justify-center">
                                 <p className="text-[10px] font-bold uppercase tracking-wider text-gray-400">{format(day, 'EEEEE', { locale: es })}</p>
                                 <p className="text-sm font-black">{format(day, 'd')}</p>
@@ -1240,7 +1350,7 @@ export default function App() {
                                         <p className="text-[9px] text-gray-400 uppercase font-bold">{emp.weeklyHours}h</p>
                                       </div>
                                     </div>
-                                    {periodDays.map(day => {
+                                    {displayedDays.map(day => {
                                       const dateStr = format(day, 'yyyy-MM-dd');
                                       const shift = quadrant.find(s => s.employeeId === emp.id && s.date === dateStr);
                                       
@@ -1405,10 +1515,12 @@ export default function App() {
                       <div className="flex justify-between items-center mb-8">
                         <h3 className="text-xl font-bold">Listado de Personal</h3>
                         <div className="flex gap-3">
-                          <label className="bg-white border border-gray-200 text-gray-600 px-4 py-2 rounded-xl text-sm font-bold flex items-center gap-2 hover:bg-gray-50 transition-all cursor-pointer shadow-sm">
-                            <Save className="w-4 h-4 text-coffee-800" /> Subir Excel
-                            <input type="file" accept=".xlsx, .xls, .csv" className="hidden" onChange={handleFileUpload} />
-                          </label>
+                          {currentUser?.role === 'admin' && (
+                            <label className="bg-white border border-gray-200 text-gray-600 px-4 py-2 rounded-xl text-sm font-bold flex items-center gap-2 hover:bg-gray-50 transition-all cursor-pointer shadow-sm">
+                              <Save className="w-4 h-4 text-coffee-800" /> Subir Excel
+                              <input type="file" accept=".xlsx, .xls, .csv" className="hidden" onChange={handleFileUpload} />
+                            </label>
+                          )}
                           <button 
                             onClick={() => {
                               // Logic to open a modal or scroll to form could go here
@@ -1446,6 +1558,172 @@ export default function App() {
                             </div>
                           </div>
                         ))}
+                      </div>
+
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-8">
+                        <div className="bg-gray-50 rounded-3xl p-6 border border-gray-100">
+                          <h3 className="text-sm font-bold uppercase tracking-wider text-gray-400 mb-4">Añadir Planificación de Vacaciones</h3>
+                          <div className="grid grid-cols-1 gap-4">
+                            <div className="space-y-2">
+                              <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Empleado</label>
+                              <select 
+                                className="w-full p-3 rounded-xl border border-gray-200 focus:border-coffee-800 outline-none bg-white text-sm"
+                                id="tab-vacation-employee-select"
+                              >
+                                <option value="">Seleccionar empleado...</option>
+                                {employees.map(emp => (
+                                  <option key={emp.id} value={emp.id}>{emp.firstName} {emp.lastName}</option>
+                                ))}
+                              </select>
+                            </div>
+                            <div className="grid grid-cols-2 gap-4">
+                              <div className="space-y-2">
+                                <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Fecha Inicio</label>
+                                <input type="date" id="tab-vacation-start" className="w-full p-3 rounded-xl border border-gray-200 focus:border-coffee-800 outline-none bg-white text-sm" />
+                              </div>
+                              <div className="space-y-2">
+                                <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Fecha Fin</label>
+                                <input type="date" id="tab-vacation-end" className="w-full p-3 rounded-xl border border-gray-200 focus:border-coffee-800 outline-none bg-white text-sm" />
+                              </div>
+                            </div>
+                            <button 
+                              onClick={() => {
+                                const empSelect = document.getElementById('tab-vacation-employee-select') as HTMLSelectElement;
+                                const startInput = document.getElementById('tab-vacation-start') as HTMLInputElement;
+                                const endInput = document.getElementById('tab-vacation-end') as HTMLInputElement;
+                                
+                                const empId = empSelect.value;
+                                const start = startInput.value;
+                                const end = endInput.value;
+                                
+                                if (!empId || !start || !end) return;
+                                
+                                const startDate = new Date(start);
+                                const endDate = new Date(end);
+                                const dates: string[] = [];
+                                let curr = new Date(startDate);
+                                
+                                while (curr <= endDate) {
+                                  dates.push(format(curr, 'yyyy-MM-dd'));
+                                  curr.setDate(curr.getDate() + 1);
+                                }
+                                
+                                setAllEmployees(prev => prev.map(emp => {
+                                  if (emp.id === empId) {
+                                    return {
+                                      ...emp,
+                                      vacationDates: Array.from(new Set([...emp.vacationDates, ...dates]))
+                                    };
+                                  }
+                                  return emp;
+                                }));
+                                
+                                const updatedEmployees = employees.map(emp => {
+                                  if (emp.id === empId) {
+                                    return {
+                                      ...emp,
+                                      vacationDates: Array.from(new Set([...emp.vacationDates, ...dates]))
+                                    };
+                                  }
+                                  return emp;
+                                });
+                                
+                                empSelect.value = "";
+                                startInput.value = "";
+                                endInput.value = "";
+
+                                if (quadrant.length > 0) {
+                                  generateQuadrant(updatedEmployees);
+                                }
+                              }}
+                              className="w-full bg-coffee-800 text-white p-3 rounded-xl font-bold hover:bg-coffee-900 transition-all shadow-lg shadow-coffee-100 flex items-center justify-center"
+                            >
+                              Registrar Vacaciones
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="bg-gray-50 rounded-3xl p-6 border border-gray-100">
+                          <h3 className="text-sm font-bold uppercase tracking-wider text-gray-400 mb-4">Añadir Baja Médica</h3>
+                          <div className="grid grid-cols-1 gap-4">
+                            <div className="space-y-2">
+                              <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Empleado</label>
+                              <select 
+                                className="w-full p-3 rounded-xl border border-gray-200 focus:border-coffee-800 outline-none bg-white text-sm"
+                                id="tab-medical-employee-select"
+                              >
+                                <option value="">Seleccionar empleado...</option>
+                                {employees.map(emp => (
+                                  <option key={emp.id} value={emp.id}>{emp.firstName} {emp.lastName}</option>
+                                ))}
+                              </select>
+                            </div>
+                            <div className="grid grid-cols-2 gap-4">
+                              <div className="space-y-2">
+                                <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Fecha Inicio</label>
+                                <input type="date" id="tab-medical-start" className="w-full p-3 rounded-xl border border-gray-200 focus:border-coffee-800 outline-none bg-white text-sm" />
+                              </div>
+                              <div className="space-y-2">
+                                <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Fecha Fin</label>
+                                <input type="date" id="tab-medical-end" className="w-full p-3 rounded-xl border border-gray-200 focus:border-coffee-800 outline-none bg-white text-sm" />
+                              </div>
+                            </div>
+                            <button 
+                              onClick={() => {
+                                const empSelect = document.getElementById('tab-medical-employee-select') as HTMLSelectElement;
+                                const startInput = document.getElementById('tab-medical-start') as HTMLInputElement;
+                                const endInput = document.getElementById('tab-medical-end') as HTMLInputElement;
+                                
+                                const empId = empSelect.value;
+                                const start = startInput.value;
+                                const end = endInput.value;
+                                
+                                if (!empId || !start || !end) return;
+                                
+                                const startDate = new Date(start);
+                                const endDate = new Date(end);
+                                const dates: string[] = [];
+                                let curr = new Date(startDate);
+                                
+                                while (curr <= endDate) {
+                                  dates.push(format(curr, 'yyyy-MM-dd'));
+                                  curr.setDate(curr.getDate() + 1);
+                                }
+                                
+                                setAllEmployees(prev => prev.map(emp => {
+                                  if (emp.id === empId) {
+                                    return {
+                                      ...emp,
+                                      medicalLeaveDates: Array.from(new Set([...(emp.medicalLeaveDates || []), ...dates]))
+                                    };
+                                  }
+                                  return emp;
+                                }));
+                                
+                                const updatedEmployees = employees.map(emp => {
+                                  if (emp.id === empId) {
+                                    return {
+                                      ...emp,
+                                      medicalLeaveDates: Array.from(new Set([...(emp.medicalLeaveDates || []), ...dates]))
+                                    };
+                                  }
+                                  return emp;
+                                });
+                                
+                                empSelect.value = "";
+                                startInput.value = "";
+                                endInput.value = "";
+
+                                if (quadrant.length > 0) {
+                                  generateQuadrant(updatedEmployees);
+                                }
+                              }}
+                              className="w-full bg-red-500 text-white p-3 rounded-xl font-bold hover:bg-red-600 transition-all shadow-lg shadow-red-100 flex items-center justify-center"
+                            >
+                              Registrar Baja
+                            </button>
+                          </div>
+                        </div>
                       </div>
 
                       <div id="employee-form-container" className="pt-8 mt-8 border-t border-gray-100">
