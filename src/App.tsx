@@ -41,7 +41,26 @@ import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import * as XLSX from 'xlsx';
 
-import { Employee, RestaurantConfig, Shift, ShiftType, Position } from './types';
+import { Employee, RestaurantConfig, Shift, ShiftType, Position, User, BusinessUnit, QuadrantState } from './types';
+
+const USERS: User[] = [
+  { id: '001', role: 'admin' },
+  { id: '002', role: 'admin' },
+  { id: '003', role: 'admin' },
+  { id: '202', role: 'manager', assignedUnitId: '202' },
+  { id: '204', role: 'manager', assignedUnitId: '204' },
+  { id: '301', role: 'manager', assignedUnitId: '301' },
+  { id: '401', role: 'manager', assignedUnitId: '401' },
+  { id: '402', role: 'manager', assignedUnitId: '402' },
+];
+
+const BUSINESS_UNITS: BusinessUnit[] = [
+  { id: '202', name: 'Unidad 202' },
+  { id: '204', name: 'Unidad 204' },
+  { id: '301', name: 'Unidad 301' },
+  { id: '401', name: 'Unidad 401' },
+  { id: '402', name: 'Unidad 402' },
+];
 
 // Utility for tailwind classes
 function cn(...inputs: ClassValue[]) {
@@ -49,6 +68,11 @@ function cn(...inputs: ClassValue[]) {
 }
 
 export default function App() {
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [currentUnitId, setCurrentUnitId] = useState<string>('');
+  const [loginId, setLoginId] = useState('');
+  const [loginError, setLoginError] = useState('');
+
   const [step, setStep] = useState<'landing' | 'setup' | 'dashboard'>('landing');
   const [config, setConfig] = useState<RestaurantConfig>({
     hasSplitShifts: true,
@@ -71,12 +95,83 @@ export default function App() {
     vatRate: 10,
   });
 
-  const [employees, setEmployees] = useState<Employee[]>([]);
-  const [quadrant, setQuadrant] = useState<Shift[]>([]);
+  const [allEmployees, setAllEmployees] = useState<Employee[]>(() => {
+    const saved = localStorage.getItem('all_employees');
+    return saved ? JSON.parse(saved) : [];
+  });
+  
+  const [allQuadrants, setAllQuadrants] = useState<QuadrantState[]>(() => {
+    const saved = localStorage.getItem('all_quadrants');
+    return saved ? JSON.parse(saved) : [];
+  });
+
   const [isGenerating, setIsGenerating] = useState(false);
   const [aiAnalysis, setAiAnalysis] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'quadrant' | 'employees' | 'analytics' | 'settings'>('quadrant');
   const [viewMode, setViewMode] = useState<'week' | 'fortnight' | 'month'>('fortnight');
+
+  useEffect(() => {
+    localStorage.setItem('all_employees', JSON.stringify(allEmployees));
+  }, [allEmployees]);
+
+  useEffect(() => {
+    localStorage.setItem('all_quadrants', JSON.stringify(allQuadrants));
+  }, [allQuadrants]);
+
+  const handleLogin = (e: React.FormEvent) => {
+    e.preventDefault();
+    const user = USERS.find(u => u.id === loginId);
+    if (user) {
+      setCurrentUser(user);
+      setCurrentUnitId(user.assignedUnitId || BUSINESS_UNITS[0].id);
+      setStep('dashboard');
+      setLoginError('');
+    } else {
+      setLoginError('Número de usuario no válido');
+    }
+  };
+
+  const currentMonth = format(new Date(), 'yyyy-MM');
+
+  const employees = useMemo(() => {
+    return allEmployees.filter(emp => emp.businessUnitId === currentUnitId);
+  }, [allEmployees, currentUnitId]);
+
+  const currentQuadrantState = useMemo(() => {
+    return allQuadrants.find(q => q.businessUnitId === currentUnitId && q.month === currentMonth) || {
+      month: currentMonth,
+      businessUnitId: currentUnitId,
+      shifts: [],
+      isPublished: false
+    };
+  }, [allQuadrants, currentUnitId, currentMonth]);
+
+  const quadrant = currentQuadrantState.shifts;
+  const isPublished = currentQuadrantState.isPublished;
+
+  const setQuadrant = (newShifts: Shift[] | ((prev: Shift[]) => Shift[])) => {
+    setAllQuadrants(prev => {
+      const existing = prev.find(q => q.businessUnitId === currentUnitId && q.month === currentMonth);
+      const updatedShifts = typeof newShifts === 'function' ? newShifts(existing?.shifts || []) : newShifts;
+      
+      if (existing) {
+        return prev.map(q => q === existing ? { ...q, shifts: updatedShifts } : q);
+      } else {
+        return [...prev, { month: currentMonth, businessUnitId: currentUnitId, shifts: updatedShifts, isPublished: false }];
+      }
+    });
+  };
+
+  const publishQuadrant = () => {
+    setAllQuadrants(prev => {
+      return prev.map(q => {
+        if (q.businessUnitId === currentUnitId && q.month === currentMonth) {
+          return { ...q, isPublished: true };
+        }
+        return q;
+      });
+    });
+  };
 
   // --- Setup Wizard State ---
   const [setupStep, setSetupStep] = useState(1);
@@ -90,14 +185,16 @@ export default function App() {
   };
 
   const addEmployee = (e: Employee) => {
-    setEmployees([...employees, e]);
+    const employeeWithUnit = { ...e, businessUnitId: currentUnitId };
+    setAllEmployees([...allEmployees, employeeWithUnit]);
   };
 
   const removeEmployee = (id: string) => {
-    setEmployees(employees.filter(emp => emp.id !== id));
+    setAllEmployees(allEmployees.filter(emp => emp.id !== id));
   };
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (currentUser?.role !== 'admin') return;
     const file = e.target.files?.[0];
     if (!file) return;
 
@@ -109,18 +206,19 @@ export default function App() {
       const ws = wb.Sheets[wsname];
       const data = XLSX.utils.sheet_to_json(ws, { header: 1 }) as any[][];
 
-      // Assuming columns: Nombre Apellidos, Jornada Semanal, Posición, Refuerzo, Coste Mensual
+      // Assuming columns: Nombre, Posición, Jornada Semanal, Coste Mensual
       // Skip header row
       const newEmployees: Employee[] = data.slice(1).map((row, index) => {
         const fullName = String(row[0] || '');
         const [firstName, ...lastNameParts] = fullName.split(' ');
         const lastName = lastNameParts.join(' ');
-        const weeklyHours = Number(row[1]) || 40;
-        const posInput = String(row[2] || '').toLowerCase();
-        const isRefuerzo = String(row[3] || '').toLowerCase().includes('sí') || String(row[3] || '').toLowerCase().includes('si') || Boolean(row[3]);
+        
+        const posInput = String(row[1] || '').toLowerCase();
         const position: Position = posInput.includes('cocina') ? 'cocina' : 
                                   posInput.includes('sala') ? 'sala' : 'refuerzo';
-        const monthlyCost = Number(row[4]) || 0;
+        
+        const weeklyHours = Number(row[2]) || 40;
+        const monthlyCost = Number(row[3]) || 0;
 
         return {
           id: `excel-${Date.now()}-${index}`,
@@ -132,12 +230,13 @@ export default function App() {
           vacationDates: [],
           medicalLeaveDates: [],
           position,
-          isRefuerzo,
-          monthlyCost
+          isRefuerzo: position === 'refuerzo',
+          monthlyCost,
+          businessUnitId: currentUnitId
         };
       });
 
-      setEmployees(prev => [...prev, ...newEmployees]);
+      setAllEmployees(prev => [...prev, ...newEmployees]);
     };
     reader.readAsBinaryString(file);
   };
@@ -158,6 +257,10 @@ export default function App() {
   }, [viewMode, currentPeriodStart]);
 
   const generateQuadrant = (employeesOverride?: Employee[]) => {
+    if (isPublished) {
+      alert("Este cuadrante ya ha sido publicado y no se puede regenerar automáticamente.");
+      return;
+    }
     const employeesToUse = employeesOverride || employees;
     if (employeesToUse.length === 0) return;
 
@@ -423,14 +526,14 @@ export default function App() {
         startY: 28,
         theme: 'grid',
         styles: { fontSize: 8, cellPadding: 2 },
-        headStyles: { fillColor: [16, 185, 129], textColor: 255 },
+        headStyles: { fillColor: [62, 39, 35], textColor: 255 },
         didParseCell: (data) => {
           if (data.section === 'body' && data.column.index > 0) {
             const val = data.cell.text[0];
-            if (val === 'M') data.cell.styles.fillColor = [209, 250, 229]; // Green
+            if (val === 'M') data.cell.styles.fillColor = [239, 235, 233]; // Coffee 50
             if (val === 'T') data.cell.styles.fillColor = [254, 249, 195]; // Yellow
             if (val === 'P') data.cell.styles.fillColor = [255, 237, 213]; // Orange
-            if (val === 'VAC') data.cell.styles.fillColor = [236, 253, 245];
+            if (val === 'VAC') data.cell.styles.fillColor = [215, 204, 200]; // Coffee 100
             if (val === 'BAJA') data.cell.styles.fillColor = [254, 226, 226];
           }
         }
@@ -444,53 +547,44 @@ export default function App() {
     <div className="min-h-screen bg-[#F8F9FA] text-[#1A1A1A] font-sans">
       <AnimatePresence mode="wait">
         {step === 'landing' ? (
-          <motion.div
+          <motion.div 
             key="landing"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="min-h-screen flex flex-col items-center justify-center p-6 bg-white"
+            className="min-h-screen bg-coffee-50 flex items-center justify-center p-6"
           >
-            <div className="max-w-3xl w-full text-center space-y-12">
-              <div className="flex flex-col items-center gap-4">
-                <motion.div 
-                  initial={{ scale: 0.8, opacity: 0 }}
-                  animate={{ scale: 1, opacity: 1 }}
-                  transition={{ delay: 0.2, type: "spring" }}
-                  className="w-24 h-24 bg-emerald-500 rounded-[2.5rem] flex items-center justify-center text-white shadow-2xl shadow-emerald-200 mb-4"
-                >
-                  <ChefHat className="w-12 h-12" />
-                </motion.div>
-                <motion.h1 
-                  initial={{ y: 20, opacity: 0 }}
-                  animate={{ y: 0, opacity: 1 }}
-                  transition={{ delay: 0.3 }}
-                  className="text-7xl font-black tracking-tighter text-gray-900"
-                >
-                  Staffore
-                </motion.h1>
+            <div className="max-w-md w-full bg-white rounded-[40px] p-10 shadow-2xl shadow-coffee-200 border border-coffee-100">
+              <div className="w-20 h-20 bg-coffee-800 rounded-3xl flex items-center justify-center text-white mb-8 mx-auto shadow-lg shadow-coffee-200">
+                <ChefHat className="w-10 h-10" />
               </div>
-
-              <motion.div 
-                initial={{ y: 20, opacity: 0 }}
-                animate={{ y: 0, opacity: 1 }}
-                transition={{ delay: 0.4 }}
-                className="space-y-10"
-              >
-                <button
-                  onClick={() => {
-                    setStep('dashboard');
-                    setActiveTab('settings');
-                  }}
-                  className="group relative inline-flex items-center justify-center px-16 py-6 font-bold text-white transition-all duration-300 bg-emerald-500 rounded-3xl focus:outline-none focus:ring-4 focus:ring-emerald-500/20 hover:bg-emerald-600 shadow-2xl shadow-emerald-500/30 hover:scale-105 active:scale-95"
+              <h1 className="text-4xl font-black text-center text-coffee-900 mb-4 tracking-tight">GastroPlan</h1>
+              <p className="text-center text-gray-500 mb-10 leading-relaxed">Optimización inteligente de turnos para restauración moderna.</p>
+              
+              <form onSubmit={handleLogin} className="space-y-6">
+                <div>
+                  <label className="block text-xs font-bold text-gray-400 uppercase tracking-widest mb-2 ml-1">Número de Usuario</label>
+                  <input 
+                    type="text" 
+                    value={loginId}
+                    onChange={(e) => setLoginId(e.target.value)}
+                    placeholder="Ej: 001, 202..."
+                    className="w-full p-4 rounded-2xl border border-gray-100 focus:border-coffee-800 outline-none transition-all bg-gray-50 text-center text-xl font-bold tracking-widest"
+                  />
+                  {loginError && <p className="text-red-500 text-xs mt-2 text-center font-medium">{loginError}</p>}
+                </div>
+                
+                <button 
+                  type="submit"
+                  className="w-full bg-coffee-800 text-white py-5 rounded-2xl font-black text-lg hover:bg-coffee-900 transition-all shadow-xl shadow-coffee-200 flex items-center justify-center gap-3 active:scale-[0.98]"
                 >
-                  Iniciar Sesión
+                  Entrar <ChevronRight className="w-6 h-6" />
                 </button>
-
-                <p className="text-lg text-gray-500 leading-relaxed max-w-2xl mx-auto font-medium px-4">
-                  #Staffore is a powerful SaaS platform that enables franchise chains to effortlessly generate, optimize, and manage monthly employee shift schedules, ensuring legal compliance, cost control, and efficient coverage using real-time KPIs and advanced shift optimization logic.
-                </p>
-              </motion.div>
+              </form>
+              
+              <div className="mt-10 pt-8 border-t border-gray-50 text-center">
+                <p className="text-xs text-gray-400 font-medium">© 2024 GastroPlan AI Solutions</p>
+              </div>
             </div>
           </motion.div>
         ) : step === 'setup' ? (
@@ -519,7 +613,7 @@ export default function App() {
                     key={s} 
                     className={cn(
                       "h-1.5 flex-1 rounded-full transition-all duration-500",
-                      setupStep >= s ? "bg-emerald-500" : "bg-gray-100"
+                      setupStep >= s ? "bg-coffee-800" : "bg-gray-100"
                     )}
                   />
                 ))}
@@ -535,7 +629,7 @@ export default function App() {
                           onClick={() => setConfig({...config, hasSplitShifts: true})}
                           className={cn(
                             "flex-1 py-4 rounded-2xl border-2 transition-all font-medium",
-                            config.hasSplitShifts ? "border-emerald-500 bg-emerald-50 text-emerald-700" : "border-gray-100 hover:border-gray-200"
+                            config.hasSplitShifts ? "border-coffee-800 bg-coffee-50 text-coffee-900" : "border-gray-100 hover:border-gray-200"
                           )}
                         >
                           Sí (M, T, P)
@@ -544,7 +638,7 @@ export default function App() {
                           onClick={() => setConfig({...config, hasSplitShifts: false})}
                           className={cn(
                             "flex-1 py-4 rounded-2xl border-2 transition-all font-medium",
-                            !config.hasSplitShifts ? "border-emerald-500 bg-emerald-50 text-emerald-700" : "border-gray-100 hover:border-gray-200"
+                            !config.hasSplitShifts ? "border-coffee-800 bg-coffee-50 text-coffee-900" : "border-gray-100 hover:border-gray-200"
                           )}
                         >
                           No (M, T)
@@ -561,7 +655,7 @@ export default function App() {
                             onClick={() => setConfig({...config, restDaysPerWeek: d})}
                             className={cn(
                               "flex-1 py-4 rounded-2xl border-2 transition-all font-medium",
-                              config.restDaysPerWeek === d ? "border-emerald-500 bg-emerald-50 text-emerald-700" : "border-gray-100 hover:border-gray-200"
+                              config.restDaysPerWeek === d ? "border-coffee-800 bg-coffee-50 text-coffee-900" : "border-gray-100 hover:border-gray-200"
                             )}
                           >
                             {d} {d === 1 ? 'día' : 'días'}
@@ -577,7 +671,7 @@ export default function App() {
                           onClick={() => setConfig({...config, contiguousRestDays: true})}
                           className={cn(
                             "flex-1 py-4 rounded-2xl border-2 transition-all font-medium",
-                            config.contiguousRestDays ? "border-emerald-500 bg-emerald-50 text-emerald-700" : "border-gray-100 hover:border-gray-200"
+                            config.contiguousRestDays ? "border-coffee-800 bg-coffee-50 text-coffee-900" : "border-gray-100 hover:border-gray-200"
                           )}
                         >
                           Sí
@@ -586,7 +680,7 @@ export default function App() {
                           onClick={() => setConfig({...config, contiguousRestDays: false})}
                           className={cn(
                             "flex-1 py-4 rounded-2xl border-2 transition-all font-medium",
-                            !config.contiguousRestDays ? "border-emerald-500 bg-emerald-50 text-emerald-700" : "border-gray-100 hover:border-gray-200"
+                            !config.contiguousRestDays ? "border-coffee-800 bg-coffee-50 text-coffee-900" : "border-gray-100 hover:border-gray-200"
                           )}
                         >
                           No
@@ -612,7 +706,7 @@ export default function App() {
                       <label className="block text-sm font-semibold uppercase tracking-wider text-gray-400">Objetivo Ventas Mensual (Bruto €)</label>
                       <input 
                         type="number"
-                        className="w-full p-4 rounded-2xl border-2 border-gray-100 focus:border-emerald-500 outline-none transition-all"
+                        className="w-full p-4 rounded-2xl border-2 border-gray-100 focus:border-coffee-800 outline-none transition-all"
                         value={config.salesTarget}
                         onChange={(e) => setConfig({...config, salesTarget: Number(e.target.value)})}
                       />
@@ -635,7 +729,7 @@ export default function App() {
 
                   <div className="space-y-6 pt-8 border-t border-gray-100">
                     <h3 className="text-lg font-bold flex items-center gap-2">
-                      <Clock className="w-5 h-5 text-emerald-500" />
+                      <Clock className="w-5 h-5 text-coffee-800" />
                       Horarios de Turnos
                     </h3>
                     
@@ -743,7 +837,7 @@ export default function App() {
                       <div className="flex justify-between items-center mb-4">
                         <h3 className="text-sm font-bold uppercase tracking-wider text-gray-400">Añadir Manualmente</h3>
                         <label className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold cursor-pointer hover:bg-gray-50 transition-all shadow-sm">
-                          <Save className="w-4 h-4 text-emerald-500" />
+                          <Save className="w-4 h-4 text-coffee-800" />
                           Subir Excel
                           <input type="file" accept=".xlsx, .xls, .csv" className="hidden" onChange={handleFileUpload} />
                         </label>
@@ -768,11 +862,11 @@ export default function App() {
                         </div>
                         <div className="space-y-2">
                           <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Fecha Inicio</label>
-                          <input type="date" id="vacation-start" className="w-full p-3 rounded-xl border border-gray-200 focus:border-emerald-500 outline-none bg-white text-sm" />
+                          <input type="date" id="vacation-start" className="w-full p-3 rounded-xl border border-gray-200 focus:border-coffee-800 outline-none bg-white text-sm" />
                         </div>
                         <div className="space-y-2">
                           <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Fecha Fin</label>
-                          <input type="date" id="vacation-end" className="w-full p-3 rounded-xl border border-gray-200 focus:border-emerald-500 outline-none bg-white text-sm" />
+                          <input type="date" id="vacation-end" className="w-full p-3 rounded-xl border border-gray-200 focus:border-coffee-800 outline-none bg-white text-sm" />
                         </div>
                         <button 
                           onClick={() => {
@@ -796,6 +890,16 @@ export default function App() {
                               curr.setDate(curr.getDate() + 1);
                             }
                             
+                            setAllEmployees(prev => prev.map(emp => {
+                              if (emp.id === empId) {
+                                return {
+                                  ...emp,
+                                  vacationDates: Array.from(new Set([...emp.vacationDates, ...dates]))
+                                };
+                              }
+                              return emp;
+                            }));
+                            
                             const updatedEmployees = employees.map(emp => {
                               if (emp.id === empId) {
                                 return {
@@ -805,8 +909,6 @@ export default function App() {
                               }
                               return emp;
                             });
-
-                            setEmployees(updatedEmployees);
                             
                             // Clear inputs
                             empSelect.value = "";
@@ -827,9 +929,9 @@ export default function App() {
 
                     <div className="space-y-3 max-h-[300px] overflow-y-auto pr-2">
                       {employees.map(emp => (
-                        <div key={emp.id} className="flex items-center justify-between bg-white p-4 rounded-2xl border border-gray-100 group hover:border-emerald-200 transition-all">
+                        <div key={emp.id} className="flex items-center justify-between bg-white p-4 rounded-2xl border border-gray-100 group hover:border-coffee-200 transition-all">
                           <div className="flex items-center gap-4">
-                            <div className="w-10 h-10 bg-emerald-100 rounded-full flex items-center justify-center text-emerald-700 font-bold">
+                            <div className="w-10 h-10 bg-coffee-100 rounded-full flex items-center justify-center text-coffee-900 font-bold">
                               {emp.firstName[0]}{emp.lastName[0]}
                             </div>
                             <div>
@@ -904,7 +1006,7 @@ export default function App() {
                     </button>
                     <button 
                       onClick={handleFinishSetup}
-                      className="bg-emerald-500 text-white px-12 py-4 rounded-2xl font-bold hover:bg-emerald-600 transition-all shadow-lg shadow-emerald-200"
+                      className="bg-coffee-800 text-white px-12 py-4 rounded-2xl font-bold hover:bg-coffee-900 transition-all shadow-lg shadow-coffee-200"
                     >
                       Empezar ahora
                     </button>
@@ -922,39 +1024,80 @@ export default function App() {
           >
             {/* Sidebar */}
             <aside className="w-72 bg-white border-r border-black/5 flex flex-col">
-              <div className="p-8 flex items-center gap-3">
-                <div className="w-10 h-10 bg-emerald-500 rounded-xl flex items-center justify-center text-white shadow-lg shadow-emerald-200">
-                  <ChefHat className="w-5 h-5" />
+              <div className="p-8 flex flex-col h-full">
+                <div className="flex items-center gap-3 mb-12">
+                  <div className="w-10 h-10 bg-coffee-800 rounded-xl flex items-center justify-center text-white shadow-lg shadow-coffee-200">
+                    <ChefHat className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <h2 className="font-black text-xl tracking-tight">GastroPlan</h2>
+                    <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Admin Panel</p>
+                  </div>
                 </div>
-                <span className="font-bold text-xl tracking-tight">Staffore</span>
-              </div>
 
-              <nav className="flex-1 px-4 space-y-2">
-                <SidebarItem 
-                  icon={<Calendar className="w-5 h-5" />} 
-                  label="Cuadrante" 
-                  active={activeTab === 'quadrant'} 
-                  onClick={() => setActiveTab('quadrant')}
-                />
-                <SidebarItem 
-                  icon={<Users className="w-5 h-5" />} 
-                  label="Equipo" 
-                  active={activeTab === 'employees'} 
-                  onClick={() => setActiveTab('employees')}
-                />
-                <SidebarItem 
-                  icon={<TrendingUp className="w-5 h-5" />} 
-                  label="Analíticas" 
-                  active={activeTab === 'analytics'} 
-                  onClick={() => setActiveTab('analytics')}
-                />
-                <SidebarItem 
-                  icon={<Settings className="w-5 h-5" />} 
-                  label="Ajustes" 
-                  active={activeTab === 'settings'} 
-                  onClick={() => setActiveTab('settings')}
-                />
-              </nav>
+                {currentUser?.role === 'admin' && (
+                  <div className="mb-8 space-y-2">
+                    <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400 ml-1">Localización</label>
+                    <div className="grid grid-cols-2 gap-2">
+                      {BUSINESS_UNITS.map(unit => (
+                        <button
+                          key={unit.id}
+                          onClick={() => setCurrentUnitId(unit.id)}
+                          className={cn(
+                            "px-3 py-2 rounded-xl text-[10px] font-bold transition-all border",
+                            currentUnitId === unit.id 
+                              ? "bg-coffee-800 text-white border-coffee-800 shadow-md" 
+                              : "bg-white text-gray-500 border-gray-100 hover:bg-gray-50"
+                          )}
+                        >
+                          {unit.id}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                
+                <nav className="space-y-2 flex-1">
+                  <SidebarItem 
+                    icon={<Calendar className="w-5 h-5" />} 
+                    label="Cuadrante" 
+                    active={activeTab === 'quadrant'} 
+                    onClick={() => setActiveTab('quadrant')}
+                  />
+                  <SidebarItem 
+                    icon={<Users className="w-5 h-5" />} 
+                    label="Equipo" 
+                    active={activeTab === 'employees'} 
+                    onClick={() => setActiveTab('employees')}
+                  />
+                  <SidebarItem 
+                    icon={<TrendingUp className="w-5 h-5" />} 
+                    label="Analíticas" 
+                    active={activeTab === 'analytics'} 
+                    onClick={() => setActiveTab('analytics')}
+                  />
+                  <SidebarItem 
+                    icon={<Settings className="w-5 h-5" />} 
+                    label="Ajustes" 
+                    active={activeTab === 'settings'} 
+                    onClick={() => setActiveTab('settings')}
+                  />
+                </nav>
+
+                <div className="pt-8 mt-8 border-t border-gray-50">
+                  <button 
+                    onClick={() => {
+                      setCurrentUser(null);
+                      setStep('landing');
+                      setLoginId('');
+                    }}
+                    className="w-full flex items-center gap-3 px-4 py-3 rounded-2xl text-red-500 hover:bg-red-50 transition-all font-medium"
+                  >
+                    <Trash2 className="w-5 h-5" />
+                    Cerrar Sesión ({currentUser?.id})
+                  </button>
+                </div>
+              </div>
             </aside>
 
             {/* Main Content */}
@@ -967,7 +1110,7 @@ export default function App() {
                   <div>
                     <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-1">Coste de Personal</p>
                     <div className="flex items-baseline gap-2">
-                      <p className="text-3xl font-black text-emerald-600">{laborCostStats.percentage}%</p>
+                      <p className="text-3xl font-black text-coffee-800">{laborCostStats.percentage}%</p>
                       <p className="text-xs text-gray-400">s/ ventas netas</p>
                     </div>
                   </div>
@@ -976,7 +1119,7 @@ export default function App() {
                       <div 
                         className={cn(
                           "h-full rounded-full transition-all duration-1000",
-                          Number(laborCostStats.percentage) > config.targetPersonnelCost ? "bg-red-500" : "bg-emerald-500"
+                          Number(laborCostStats.percentage) > config.targetPersonnelCost ? "bg-red-500" : "bg-coffee-800"
                         )}
                         style={{ width: `${Math.min(Number(laborCostStats.percentage), 100)}%` }}
                       />
@@ -1004,6 +1147,19 @@ export default function App() {
                 <div className="flex gap-3">
                   {activeTab === 'quadrant' && (
                     <>
+                      <button 
+                        onClick={publishQuadrant}
+                        disabled={isPublished}
+                        className={cn(
+                          "p-3 rounded-2xl transition-all shadow-sm flex items-center gap-2 text-sm font-bold",
+                          isPublished 
+                            ? "bg-green-50 text-green-700 border border-green-200" 
+                            : "bg-white border border-gray-200 text-gray-600 hover:bg-gray-50"
+                        )}
+                      >
+                        <CheckCircle2 className="w-5 h-5" />
+                        {isPublished ? 'Cuadrante Publicado' : 'Publicar Cuadrante'}
+                      </button>
                       <div className="flex bg-white border border-gray-200 rounded-2xl p-1 shadow-sm">
                         {(['week', 'fortnight', 'month'] as const).map((mode) => (
                           <button
@@ -1011,7 +1167,7 @@ export default function App() {
                             onClick={() => setViewMode(mode)}
                             className={cn(
                               "px-4 py-2 rounded-xl text-xs font-bold transition-all",
-                              viewMode === mode ? "bg-emerald-500 text-white shadow-md" : "text-gray-500 hover:bg-gray-50"
+                              viewMode === mode ? "bg-coffee-800 text-white shadow-md" : "text-gray-500 hover:bg-gray-50"
                             )}
                           >
                             {mode === 'week' ? 'Semana' : mode === 'fortnight' ? 'Quincena' : 'Mes'}
@@ -1030,12 +1186,12 @@ export default function App() {
                     onClick={analyzeWithAI}
                     className="bg-white border border-gray-200 p-3 rounded-2xl hover:bg-gray-50 transition-all shadow-sm flex items-center gap-2 text-sm font-bold"
                   >
-                    <TrendingUp className="w-5 h-5 text-emerald-500" /> Analizar con IA
+                    <TrendingUp className="w-5 h-5 text-coffee-800" /> Analizar con IA
                   </button>
                   <button 
                     onClick={() => generateQuadrant()}
-                    disabled={isGenerating}
-                    className="bg-emerald-500 text-white px-6 py-3 rounded-2xl font-bold hover:bg-emerald-600 transition-all shadow-lg shadow-emerald-200 flex items-center gap-2 disabled:opacity-50"
+                    disabled={isGenerating || isPublished}
+                    className="bg-coffee-800 text-white px-6 py-3 rounded-2xl font-bold hover:bg-coffee-900 transition-all shadow-lg shadow-coffee-200 flex items-center gap-2 disabled:opacity-50"
                   >
                     {isGenerating ? <Clock className="w-5 h-5 animate-spin" /> : <Calendar className="w-5 h-5" />} 
                     {quadrant.length > 0 ? 'Regenerar' : 'Generar Cuadrante'}
@@ -1127,7 +1283,7 @@ export default function App() {
                         <div className="space-y-2">
                           <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Empleado</label>
                           <select 
-                            className="w-full p-3 rounded-xl border border-gray-200 focus:border-emerald-500 outline-none bg-white text-sm"
+                            className="w-full p-3 rounded-xl border border-gray-200 focus:border-coffee-800 outline-none bg-white text-sm"
                             id="medical-employee-select"
                           >
                             <option value="">Seleccionar empleado...</option>
@@ -1138,11 +1294,11 @@ export default function App() {
                         </div>
                         <div className="space-y-2">
                           <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Fecha Inicio</label>
-                          <input type="date" id="medical-start" className="w-full p-3 rounded-xl border border-gray-200 focus:border-emerald-500 outline-none bg-white text-sm" />
+                          <input type="date" id="medical-start" className="w-full p-3 rounded-xl border border-gray-200 focus:border-coffee-800 outline-none bg-white text-sm" />
                         </div>
                         <div className="space-y-2">
                           <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Fecha Fin</label>
-                          <input type="date" id="medical-end" className="w-full p-3 rounded-xl border border-gray-200 focus:border-emerald-500 outline-none bg-white text-sm" />
+                          <input type="date" id="medical-end" className="w-full p-3 rounded-xl border border-gray-200 focus:border-coffee-800 outline-none bg-white text-sm" />
                         </div>
                         <button 
                           onClick={() => {
@@ -1166,6 +1322,16 @@ export default function App() {
                               curr.setDate(curr.getDate() + 1);
                             }
                             
+                            setAllEmployees(prev => prev.map(emp => {
+                              if (emp.id === empId) {
+                                return {
+                                  ...emp,
+                                  medicalLeaveDates: Array.from(new Set([...(emp.medicalLeaveDates || []), ...dates]))
+                                };
+                              }
+                              return emp;
+                            }));
+                            
                             const updatedEmployees = employees.map(emp => {
                               if (emp.id === empId) {
                                 return {
@@ -1175,8 +1341,6 @@ export default function App() {
                               }
                               return emp;
                             });
-
-                            setEmployees(updatedEmployees);
                             
                             // Clear inputs
                             empSelect.value = "";
@@ -1212,13 +1376,13 @@ export default function App() {
                           <p className="text-sm text-blue-800 opacity-80">Viernes y Sábados configurados con refuerzo automático (+1).</p>
                         </div>
                       </div>
-                      <div className="bg-emerald-50 border border-emerald-100 rounded-3xl p-6 flex gap-4">
-                        <div className="w-12 h-12 bg-emerald-500 rounded-2xl flex items-center justify-center text-white shrink-0 shadow-lg shadow-emerald-200">
+                      <div className="bg-coffee-50 border border-coffee-100 rounded-3xl p-6 flex gap-4">
+                        <div className="w-12 h-12 bg-coffee-800 rounded-2xl flex items-center justify-center text-white shrink-0 shadow-lg shadow-coffee-200">
                           <TrendingUp className="w-6 h-6" />
                         </div>
                         <div>
-                          <h4 className="font-bold text-emerald-900">Objetivo de Coste</h4>
-                          <p className="text-sm text-emerald-800 opacity-80">
+                          <h4 className="font-bold text-coffee-900">Objetivo de Coste</h4>
+                          <p className="text-sm text-coffee-800 opacity-80">
                             {Number(laborCostStats.percentage) <= config.targetPersonnelCost 
                               ? `Estás un ${(config.targetPersonnelCost - Number(laborCostStats.percentage)).toFixed(1)}% por debajo del límite de coste de personal. ¡Buen trabajo!`
                               : `Estás un ${(Number(laborCostStats.percentage) - config.targetPersonnelCost).toFixed(1)}% por encima del límite de coste de personal.`}
@@ -1240,16 +1404,30 @@ export default function App() {
                     <div className="bg-white rounded-3xl border border-black/5 p-8 shadow-sm">
                       <div className="flex justify-between items-center mb-8">
                         <h3 className="text-xl font-bold">Listado de Personal</h3>
-                        <button className="bg-emerald-500 text-white px-4 py-2 rounded-xl text-sm font-bold flex items-center gap-2 hover:bg-emerald-600 transition-all">
-                          <Plus className="w-4 h-4" /> Nuevo Empleado
-                        </button>
+                        <div className="flex gap-3">
+                          <label className="bg-white border border-gray-200 text-gray-600 px-4 py-2 rounded-xl text-sm font-bold flex items-center gap-2 hover:bg-gray-50 transition-all cursor-pointer shadow-sm">
+                            <Save className="w-4 h-4 text-coffee-800" /> Subir Excel
+                            <input type="file" accept=".xlsx, .xls, .csv" className="hidden" onChange={handleFileUpload} />
+                          </label>
+                          <button 
+                            onClick={() => {
+                              // Logic to open a modal or scroll to form could go here
+                              // For now we'll just alert or we could add a state to show/hide form
+                              const formElement = document.getElementById('employee-form-container');
+                              if (formElement) formElement.scrollIntoView({ behavior: 'smooth' });
+                            }}
+                            className="bg-coffee-800 text-white px-4 py-2 rounded-xl text-sm font-bold flex items-center gap-2 hover:bg-coffee-900 transition-all"
+                          >
+                            <Plus className="w-4 h-4" /> Nuevo Empleado
+                          </button>
+                        </div>
                       </div>
                       
                       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                         {employees.map(emp => (
-                          <div key={emp.id} className="bg-gray-50 rounded-2xl p-6 border border-gray-100 hover:border-emerald-200 transition-all group">
+                          <div key={emp.id} className="bg-gray-50 rounded-2xl p-6 border border-gray-100 hover:border-coffee-200 transition-all group">
                             <div className="flex items-start justify-between mb-4">
-                              <div className="w-12 h-12 bg-white rounded-2xl flex items-center justify-center text-emerald-600 font-bold text-xl shadow-sm border border-gray-100 relative">
+                              <div className="w-12 h-12 bg-white rounded-2xl flex items-center justify-center text-coffee-800 font-bold text-xl shadow-sm border border-gray-100 relative">
                                 {emp.firstName[0]}{emp.lastName[0]}
                                 {emp.isRefuerzo && (
                                   <div className="absolute -top-1 -right-1 w-4 h-4 bg-amber-500 rounded-full border-2 border-white" title="Refuerzo" />
@@ -1265,17 +1443,16 @@ export default function App() {
                                 <span className="text-gray-400">Jornada</span>
                                 <span className="font-bold">{emp.weeklyHours}h / semana</span>
                               </div>
-                              <div className="flex justify-between text-sm">
-                                <span className="text-gray-400">Descansos</span>
-                                <span className="font-bold">{emp.restDaysPerWeek} días</span>
-                              </div>
-                              <div className="flex justify-between text-sm">
-                                <span className="text-gray-400">Vacaciones</span>
-                                <span className="font-bold">{emp.vacationDays} días</span>
-                              </div>
                             </div>
                           </div>
                         ))}
+                      </div>
+
+                      <div id="employee-form-container" className="pt-8 mt-8 border-t border-gray-100">
+                        <h3 className="text-lg font-bold mb-6">Añadir Nuevo Empleado</h3>
+                        <div className="bg-gray-50 rounded-2xl p-6 border border-gray-100">
+                          <EmployeeForm onAdd={addEmployee} />
+                        </div>
                       </div>
                     </div>
                   </motion.div>
@@ -1309,9 +1486,9 @@ export default function App() {
                               cursor={{ fill: '#F8FAFC' }}
                               contentStyle={{ borderRadius: '16px', border: 'none', boxShadow: '0 10px 15px -3px rgb(0 0 0 / 0.1)' }}
                             />
-                            <Bar dataKey="cost" fill="#10B981" radius={[4, 4, 0, 0]} barSize={40}>
+                            <Bar dataKey="cost" fill="#4B2C20" radius={[4, 4, 0, 0]} barSize={40}>
                               {[0,1,2,3,4,5,6].map((entry, index) => (
-                                <Cell key={`cell-${index}`} fill={index === 4 || index === 5 ? '#10B981' : '#E2E8F0'} />
+                                <Cell key={`cell-${index}`} fill={index === 4 || index === 5 ? '#4B2C20' : '#E2E8F0'} />
                               ))}
                             </Bar>
                           </BarChart>
@@ -1332,12 +1509,12 @@ export default function App() {
                                 const data = JSON.parse(aiAnalysis);
                                 return (
                                   <>
-                                    <div className="p-4 bg-emerald-50 rounded-2xl border border-emerald-100">
+                                    <div className="p-4 bg-coffee-50 rounded-2xl border border-coffee-100">
                                       <div className="flex items-center gap-3 mb-2">
-                                        <TrendingUp className="w-5 h-5 text-emerald-500" />
-                                        <span className="font-bold text-emerald-900">Eficiencia de Costes</span>
+                                        <TrendingUp className="w-5 h-5 text-coffee-800" />
+                                        <span className="font-bold text-coffee-900">Eficiencia de Costes</span>
                                       </div>
-                                      <p className="text-sm text-emerald-800">{data.costEfficiency}</p>
+                                      <p className="text-sm text-coffee-800">{data.costEfficiency}</p>
                                     </div>
                                     
                                     <div className="space-y-2">
@@ -1368,10 +1545,10 @@ export default function App() {
                           <>
                             <div className="p-4 bg-emerald-50 rounded-2xl border border-emerald-100">
                               <div className="flex items-center gap-3 mb-2">
-                                <CheckCircle2 className="w-5 h-5 text-emerald-500" />
-                                <span className="font-bold text-emerald-900">Eficiencia Óptima</span>
+                                <CheckCircle2 className="w-5 h-5 text-coffee-800" />
+                                <span className="font-bold text-coffee-900">Eficiencia Óptima</span>
                               </div>
-                              <p className="text-sm text-emerald-800">Tu cuadrante actual cubre el 98% de la demanda estimada basada en históricos.</p>
+                              <p className="text-sm text-coffee-800">Tu cuadrante actual cubre el 98% de la demanda estimada basada en históricos.</p>
                             </div>
                             
                             <div className="p-4 bg-amber-50 rounded-2xl border border-amber-100">
@@ -1420,7 +1597,7 @@ export default function App() {
                   >
                     <div className="bg-white rounded-3xl border border-black/5 p-8 shadow-sm">
                       <h3 className="text-xl font-bold mb-8 flex items-center gap-2">
-                        <Settings className="w-6 h-6 text-emerald-500" />
+                        <Settings className="w-6 h-6 text-coffee-800" />
                         Configuración del Restaurante
                       </h3>
                       
@@ -1430,7 +1607,7 @@ export default function App() {
                             <label className="text-xs font-bold uppercase tracking-wider text-gray-400">Objetivo Ventas Mensual (Bruto €)</label>
                             <input 
                               type="number"
-                              className="w-full p-4 rounded-2xl border border-gray-100 focus:border-emerald-500 outline-none transition-all bg-gray-50"
+                              className="w-full p-4 rounded-2xl border border-gray-100 focus:border-coffee-800 outline-none transition-all bg-gray-50"
                               value={config.salesTarget}
                               onChange={(e) => setConfig({...config, salesTarget: Number(e.target.value)})}
                             />
@@ -1439,7 +1616,7 @@ export default function App() {
                           <div className="space-y-2">
                             <label className="text-xs font-bold uppercase tracking-wider text-gray-400">Tipo de IVA (%)</label>
                             <select 
-                              className="w-full p-4 rounded-2xl border border-gray-100 focus:border-emerald-500 outline-none transition-all bg-gray-50"
+                              className="w-full p-4 rounded-2xl border border-gray-100 focus:border-coffee-800 outline-none transition-all bg-gray-50"
                               value={config.vatRate}
                               onChange={(e) => setConfig({...config, vatRate: Number(e.target.value)})}
                             >
@@ -1455,7 +1632,7 @@ export default function App() {
                             <input 
                               type="number"
                               step="0.1"
-                              className="w-full p-4 rounded-2xl border border-gray-100 focus:border-emerald-500 outline-none transition-all bg-gray-50"
+                              className="w-full p-4 rounded-2xl border border-gray-100 focus:border-coffee-800 outline-none transition-all bg-gray-50"
                               value={config.targetPersonnelCost}
                               onChange={(e) => setConfig({...config, targetPersonnelCost: Number(e.target.value)})}
                             />
@@ -1464,7 +1641,7 @@ export default function App() {
                           <div className="space-y-2">
                             <label className="text-xs font-bold uppercase tracking-wider text-gray-400">Día de Cierre</label>
                             <select 
-                              className="w-full p-4 rounded-2xl border border-gray-100 focus:border-emerald-500 outline-none transition-all bg-gray-50"
+                              className="w-full p-4 rounded-2xl border border-gray-100 focus:border-coffee-800 outline-none transition-all bg-gray-50"
                               value={config.closingDay || ''}
                               onChange={(e) => setConfig({...config, closingDay: e.target.value || null})}
                             >
@@ -1481,7 +1658,7 @@ export default function App() {
                               onClick={() => setConfig({...config, hasSplitShifts: !config.hasSplitShifts})}
                               className={cn(
                                 "w-12 h-6 rounded-full transition-all relative",
-                                config.hasSplitShifts ? "bg-emerald-500" : "bg-gray-200"
+                                config.hasSplitShifts ? "bg-coffee-800" : "bg-gray-200"
                               )}
                             >
                               <div className={cn(
@@ -1557,7 +1734,7 @@ function SidebarItem({ icon, label, active, onClick }: { icon: React.ReactNode, 
       className={cn(
         "w-full flex items-center gap-3 px-4 py-3 rounded-2xl transition-all font-medium",
         active 
-          ? "bg-emerald-50 text-emerald-700 shadow-sm border border-emerald-100" 
+          ? "bg-coffee-50 text-coffee-800 shadow-sm border border-coffee-100" 
           : "text-gray-500 hover:bg-gray-50 hover:text-gray-900"
       )}
     >
@@ -1575,13 +1752,14 @@ function EmployeeForm({ onAdd }: { onAdd: (e: Employee) => void }) {
     restDays: 2,
     vacations: 30,
     position: 'sala' as Position,
-    isRefuerzo: false,
-    monthlyCost: 0
+    isRefuerzo: false
   });
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!formData.firstName || !formData.lastName) return;
+    
+    const calculatedMonthlyCost = (formData.weeklyHours / 40) * 2000;
     
     onAdd({
       id: Math.random().toString(36).substr(2, 9),
@@ -1594,10 +1772,11 @@ function EmployeeForm({ onAdd }: { onAdd: (e: Employee) => void }) {
       medicalLeaveDates: [],
       position: formData.position,
       isRefuerzo: formData.isRefuerzo,
-      monthlyCost: formData.monthlyCost
+      monthlyCost: calculatedMonthlyCost,
+      businessUnitId: '' // Will be set by onAdd
     });
     
-    setFormData({ ...formData, firstName: '', lastName: '', isRefuerzo: false, weeklyHours: 40, restDays: 2, vacations: 30, position: 'sala', monthlyCost: 0 });
+    setFormData({ ...formData, firstName: '', lastName: '', isRefuerzo: false, weeklyHours: 40, restDays: 2, vacations: 30, position: 'sala' });
   };
 
   return (
@@ -1607,7 +1786,7 @@ function EmployeeForm({ onAdd }: { onAdd: (e: Employee) => void }) {
         <input 
           type="text" 
           placeholder="Nombre"
-          className="w-full p-3 rounded-xl border border-gray-200 focus:border-emerald-500 outline-none bg-white text-sm"
+          className="w-full p-3 rounded-xl border border-gray-200 focus:border-coffee-800 outline-none bg-white text-sm"
           value={formData.firstName}
           onChange={e => setFormData({...formData, firstName: e.target.value})}
         />
@@ -1617,7 +1796,7 @@ function EmployeeForm({ onAdd }: { onAdd: (e: Employee) => void }) {
         <input 
           type="text" 
           placeholder="Apellidos"
-          className="w-full p-3 rounded-xl border border-gray-200 focus:border-emerald-500 outline-none bg-white text-sm"
+          className="w-full p-3 rounded-xl border border-gray-200 focus:border-coffee-800 outline-none bg-white text-sm"
           value={formData.lastName}
           onChange={e => setFormData({...formData, lastName: e.target.value})}
         />
@@ -1625,7 +1804,7 @@ function EmployeeForm({ onAdd }: { onAdd: (e: Employee) => void }) {
       <div className="space-y-2">
         <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Posición</label>
         <select 
-          className="w-full p-3 rounded-xl border border-gray-200 focus:border-emerald-500 outline-none bg-white text-sm"
+          className="w-full p-3 rounded-xl border border-gray-200 focus:border-coffee-800 outline-none bg-white text-sm"
           value={formData.position}
           onChange={e => setFormData({...formData, position: e.target.value as Position})}
         >
@@ -1637,7 +1816,7 @@ function EmployeeForm({ onAdd }: { onAdd: (e: Employee) => void }) {
       <div className="space-y-2">
         <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Jornada</label>
         <select 
-          className="w-full p-3 rounded-xl border border-gray-200 focus:border-emerald-500 outline-none bg-white text-sm"
+          className="w-full p-3 rounded-xl border border-gray-200 focus:border-coffee-800 outline-none bg-white text-sm"
           value={formData.weeklyHours}
           onChange={e => setFormData({...formData, weeklyHours: Number(e.target.value)})}
         >
@@ -1648,19 +1827,9 @@ function EmployeeForm({ onAdd }: { onAdd: (e: Employee) => void }) {
         </select>
       </div>
       <div className="space-y-2">
-        <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Coste Mensual (€)</label>
-        <input 
-          type="number" 
-          placeholder="0"
-          className="w-full p-3 rounded-xl border border-gray-200 focus:border-emerald-500 outline-none bg-white text-sm"
-          value={formData.monthlyCost}
-          onChange={e => setFormData({...formData, monthlyCost: Number(e.target.value)})}
-        />
-      </div>
-      <div className="space-y-2">
         <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Descansos</label>
         <select 
-          className="w-full p-3 rounded-xl border border-gray-200 focus:border-emerald-500 outline-none bg-white text-sm"
+          className="w-full p-3 rounded-xl border border-gray-200 focus:border-coffee-800 outline-none bg-white text-sm"
           value={formData.restDays}
           onChange={e => setFormData({...formData, restDays: Number(e.target.value)})}
         >
@@ -1672,14 +1841,14 @@ function EmployeeForm({ onAdd }: { onAdd: (e: Employee) => void }) {
         <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400 mb-2">Refuerzo</label>
         <input 
           type="checkbox" 
-          className="w-6 h-6 accent-emerald-500 cursor-pointer"
+          className="w-6 h-6 accent-coffee-800 cursor-pointer"
           checked={formData.isRefuerzo}
           onChange={e => setFormData({...formData, isRefuerzo: e.target.checked})}
         />
       </div>
       <button 
         type="submit"
-        className="bg-emerald-500 text-white p-3 rounded-xl font-bold hover:bg-emerald-600 transition-all shadow-lg shadow-emerald-200 flex items-center justify-center"
+        className="bg-coffee-800 text-white p-3 rounded-xl font-bold hover:bg-coffee-900 transition-all shadow-lg shadow-coffee-200 flex items-center justify-center"
       >
         <Plus className="w-5 h-5" />
       </button>
@@ -1697,7 +1866,7 @@ function ShiftSelector({ employeeId, date, hasSplit, initialType, hasConflict, o
   const getStyle = (t: ShiftType) => {
     if (hasConflict && t === 'M') return "bg-red-50 text-red-700 border-red-200 ring-2 ring-red-500 ring-offset-1";
     switch(t) {
-      case 'M': return "bg-emerald-100 text-emerald-700 border-emerald-200"; // Green
+      case 'M': return "bg-coffee-100 text-coffee-800 border-coffee-200"; // Coffee
       case 'T': return "bg-yellow-100 text-yellow-700 border-yellow-200"; // Yellow
       case 'P': return "bg-orange-100 text-orange-700 border-orange-200"; // Orange
       case 'VAC': return "bg-blue-100 text-blue-700 border-blue-200";

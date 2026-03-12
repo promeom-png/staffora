@@ -1,1 +1,15 @@
 @import "tailwindcss";
+
+@theme {
+  --color-coffee-50: #EFEBE9;
+  --color-coffee-100: #D7CCC8;
+  --color-coffee-200: #BCAAA4;
+  --color-coffee-300: #A1887F;
+  --color-coffee-400: #8D6E63;
+  --color-coffee-500: #795548;
+  --color-coffee-600: #6D4C41;
+  --color-coffee-700: #5D4037;
+  --color-coffee-800: #4E342E;
+  --color-coffee-900: #3E2723;
+  --color-coffee-950: #1B110F;
+}

@@ -13,6 +13,7 @@ export interface Employee {
   position: Position;
   isRefuerzo: boolean;
   monthlyCost: number;
+  businessUnitId: string;
 }
 
 export interface RestaurantConfig {
@@ -48,7 +49,22 @@ export interface Shift {
   type: ShiftType;
 }
 
-export interface DayQuadrant {
-  date: string;
+export interface QuadrantState {
+  month: string; // YYYY-MM
+  businessUnitId: string;
   shifts: Shift[];
+  isPublished: boolean;
+}
+
+export type UserRole = 'admin' | 'manager';
+
+export interface User {
+  id: string; // 001, 202, etc.
+  role: UserRole;
+  assignedUnitId?: string; // Only for managers
+}
+
+export interface BusinessUnit {
+  id: string;
+  name: string;
 }
